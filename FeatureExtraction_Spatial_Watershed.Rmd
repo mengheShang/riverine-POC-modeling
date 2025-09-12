@@ -1,0 +1,1236 @@
+---
+title: "Pipeline_points"
+output: html_document
+date: "2025-04-30"
+---
+
+```{r Packages and Directory}
+# Packages 
+library(terra)
+library(readxl)
+library(dplyr)
+library(purrr)
+library(readr)
+library(writexl)
+library(tidyr)
+library(ncdf4)
+library(sp)
+library(sf)
+library(furrr)
+library(future)
+
+# Directory
+root_dir <- "E:/POC research/data"
+
+paths <- list(
+  # basic data
+  points_shp       = file.path(root_dir, "5_Prediction/Spatial/Points_1.shp"),  
+  times_data        = file.path(root_dir, "POC_basic data/time.xlsx"),           
+  basins_shp   = file.path(root_dir, "POC_basic data/POC_watershed/China-basin1.shp"),
+
+  # variables rawdata
+  dem       = file.path(root_dir, "1_DEM_watershed/SRTM/SRTM_dem_90m.tif"),
+  rh_file   = file.path(root_dir, "2_Litter_Rh/Rh_RF_ensemble_mean_1982_2018.tif"),
+  litter_file       = file.path(root_dir, "2_Litter_Rh/litter_360_720.tif"),
+
+  soil = list(
+    clay            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__CLAY.tif"),
+    sand            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__SAND.tif"),
+    silt            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__SILT.tif"),
+    organic_carbon  = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__ORG_CARBON.tif"),
+    root_depth      = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__ROOT_DEPTH.tif"),
+    ph              = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__PH_WATER.tif")
+  ),
+
+  rusle_c           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_CFactor_yr2012_v1.1_25km.tif"),
+  rusle_k           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_KFactor_v1.1_25km.tif"),
+  rusle_ls          = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_LSFactor_v1.1_25km.tif"),
+  rusle_r           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_RFactor_v1.1_25km.tif"),
+
+  soilloss_2001     = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_SoilLoss_v1.1_yr2001_25km.tif"),
+  soilloss_2012     = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_SoilLoss_v1.1_yr2012_25km.tif"),
+
+  reservoirs_dams   = file.path(root_dir, "2_Reservoirs and Dams/China_Dams.shp"),
+
+  gdp_dir           = file.path(root_dir, "2_GDP"),
+  pop_base_dir      = file.path(root_dir, "2_Population"),
+
+  precipitation_nc  = file.path(root_dir, "2_pco2Data/ERA5-Land-monthly_China_1950_2022.nc"),
+  temperature_nc    = file.path(root_dir, "2_pco2Data/ERA5-Land-monthly_China_1950_2022.nc"),
+
+  npp_dir           = file.path(root_dir, "2_pco2Data/npp"),
+  landcover_dir     = file.path(root_dir, "2_pco2Data/land_covernew")
+)
+
+# General Functions
+align_rasters <- function(target, reference) {
+  # 将栅格校正到与reference一致的投影、分辨率、范围
+  if (!ext(target) == ext(reference)) {
+    target <- project(target, crs(reference)) %>%
+      resample(reference, method = "near") %>%
+      crop(ext(reference))
+  }
+  return(target)
+}
+
+safe_read <- function(path, fun = rast) {
+  if (file.exists(path)) return(fun(path))
+  warning(paste("文件不存在:", path))
+  return(NULL)
+}
+```
+
+```{r Read and Prepare Data}
+# read watersheds shp ####
+main_basins <- st_read(paths$basins_shp) %>%
+  mutate(geometry = st_make_valid(geometry)) %>%
+  mutate(ID = CHINA_B1_) %>%
+  select(ID, AREA) 
+
+crs_sf <- st_crs(main_basins)$wkt
+
+# Read Points ####
+points <- st_read(paths$points_shp) 
+
+# Prepare non spatial Basin_data ####
+basin_data <- main_basins %>%
+  st_drop_geometry() %>%
+  select(ID)
+
+# Read time series and extract year/month
+time_periods <- read_excel(paths$times_data) %>% 
+  distinct(time) %>% 
+  mutate(
+    time  = as.Date(time),
+    Year  = as.numeric(format(time, "%Y")),
+    Month = as.numeric(format(time, "%m"))
+  )
+
+# Combine all basin IDs with all time points
+points_data <- expand_grid(basin_data, time_periods)
+```
+
+```{r Constant: Slope}
+cat("\n==== Extracting Point‑level Slope from DEM ====\n")
+
+# Load DEM raster and define spatial reference
+dem <- safe_read(paths$dem)
+res_ratio <- 200 / 90  
+dem <- aggregate(dem, fact = res_ratio, fun = "mean")
+
+# slope raster
+slope <- terrain(dem, v = "slope", unit = "degrees")
+
+# robust extraction function
+extract_slope <- function(pt, slope_rast, buffer_dist = 500) {
+  # Try direct extraction
+  val <- terra::extract(slope_rast, pt)[[2]]
+  print(val)
+  if (!is.na(val)) return(val)
+  
+  print("value at point is NA")
+  NA_real_
+}
+
+# Batch extract slopes
+unique_slopes <- points %>%
+  mutate(
+    Slope = purrr::map_dbl(seq_len(nrow(points)), function(i) {
+      extract_slope(points[i, ], slope_rast = slope)
+    })
+  ) %>%
+  st_drop_geometry() %>%
+  select(ID, Slope)
+
+write_csv(unique_slopes, "E:/POC research/data/5_Prediction/Spatial/slope.csv")
+```
+
+```{r Constant: upSlope}
+cat("\n==== Calculating upSlope ====\n")
+
+# Calculate slope
+dem <- safe_read(paths$dem)
+res_ratio <- 200 / 90
+dem <- aggregate(dem, fact = res_ratio, fun = "mean")
+slope <- terrain(dem, v = "slope", unit = "degrees")
+
+# project slope to CRS of main_basins
+crs_sf <- st_crs(main_basins)$wkt
+slope <- project(slope, crs_sf)
+dem <- project(dem, crs_sf)
+
+# Calculate mean slope in every basin
+calculate_upstream_slope <- function(basin_poly) {
+  val <- terra::extract(slope, basin_poly, fun = mean, na.rm = TRUE)
+  return(val[1,2])
+}
+
+# Calculate elevation range in every basin
+calculate_elevation_range <- function(basin_poly) {
+  vals <- terra::extract(dem, basin_poly, fun = range, na.rm = TRUE)
+  elev_range <- vals[1, 3] - vals[1, 2]  # max - min
+  return(elev_range)
+}
+
+# map the function
+unique_upslopes <- main_basins %>%
+  mutate(
+    # upSlope = map_dbl(1:n(), ~ calculate_upstream_slope(main_basins[.x, ])),
+    Elev_range = map_dbl(1:n(), ~ calculate_elevation_range(main_basins))
+  ) %>%
+  st_drop_geometry() %>%
+  select(ID, upSlope, Elev_range)
+
+write_csv(unique_upslopes, "E:/POC research/data/5_Prediction/Spatial/Features/upSlope.csv")
+```
+
+```{r Constant: WatershedArea}
+cat("\n==== Calculating Watershed Area (km²) ====\n")
+
+# Function to calculate the area of a basin polygon in square kilometers
+calculate_watershed_area <- function(basin_poly) {
+  area_km2 <- st_area(basin_poly) / 1e6  # Convert from m² to km²
+  print(area_km2)
+  return(as.numeric(area_km2))
+}
+
+# Apply to each polygon in main_basins
+unique_areas <- main_basins %>%
+  mutate(
+    Area = map_dbl(1:n(), ~ calculate_watershed_area(main_basins[.x, ]))
+  ) %>%
+  st_drop_geometry() %>%
+  select(ID, Area)
+
+# Optional: clean up memory
+rm(calculate_watershed_area)
+gc()
+
+write_csv(unique_areas, "E:/POC research/data/5_Prediction/Spatial/Features/area.csv")
+```
+
+```{r Constant: Litter}
+cat("\n==== Calculating Static Mean Litter for Main Basins ====\n")
+
+litter_rast <- safe_read(paths$litter_file)  # 35-band raster
+
+litter_static <- mean(litter_rast, na.rm = TRUE)
+crs_sf <- st_crs(main_basins)$wkt
+litter_static <- project(litter_static, crs_sf)
+
+
+litter_static_results <- main_basins %>%
+  mutate(
+    Litter = map_dbl(1:n(), function(i) {
+      poly <- main_basins[i, ]
+      masked  <- mask(crop(litter_static, poly), poly)
+      global(masked, "mean", na.rm = TRUE)$mean
+    })
+  ) %>%
+  st_drop_geometry() %>%
+  select(ID, Litter)
+
+rm(litter_rast, litter_static)
+gc()
+
+write_csv(litter_static_results, "E:/POC research/data/5_Prediction/Spatial/Features/litter.csv")
+```
+
+```{r Constant: SoilSource_HWSD2}
+cat("\n==== Calculating Soil Data (HWSD2) ====\n")
+
+# Align all soil rasters to reference raster
+soil_rasters <- map(paths$soil, ~{
+  r <- safe_read(.x)
+  project(r, crs_sf) })
+
+
+# Function to extract average soil values over a polygon
+calculate_soil_vars <- function(basin_poly) {
+  soil_vars <- imap_dfc(soil_rasters, ~{
+    r_crop   <- crop(.x, basin_poly)
+    r_masked <- mask(r_crop, basin_poly)
+    val      <- global(r_masked, "mean", na.rm = TRUE)$mean
+    set_names(list(val), .y)
+  })
+  return(soil_vars)
+}
+
+# Apply to each basin polygon
+unique_soils <- main_basins %>%
+  mutate(
+    soil_data = map(1:n(), ~ calculate_soil_vars(main_basins[.x, ]))
+  ) %>%
+  unnest(soil_data) %>%
+  st_drop_geometry() %>%
+  select(ID, clay, sand, silt, organic_carbon, root_depth, ph) %>%
+  rename(
+    Clay = clay,
+    Sand = sand,
+    Silt = silt,
+    Root_Depth = root_depth,
+    SOC = organic_carbon,
+    pH_soil = ph
+  )
+
+rm(soil_rasters, calculate_soil_vars)
+gc()
+
+write_csv(unique_soils, "E:/POC research/data/5_Prediction/Spatial/Features/soilsource.csv")
+```
+
+```{r Constant: SoilErosion_RUSLE}
+cat("\n==== Calculating RUSLE Factors (C/K/LS/R) ====\n")
+
+# Load and align rasters
+rusle_c_25km  <- safe_read(paths$rusle_c) |> project(crs_sf)
+rusle_k_25km  <- safe_read(paths$rusle_k) |> project(crs_sf)
+rusle_ls_25km <- safe_read(paths$rusle_ls) |> project(crs_sf)
+rusle_r_25km  <- safe_read(paths$rusle_r) |> project(crs_sf)
+
+
+
+# Function to extract average RUSLE values over a basin polygon
+calculate_rusle_factors <- function(basin_poly) {
+  c_masked  <- mask(crop(rusle_c_25km,  basin_poly), basin_poly)
+  k_masked  <- mask(crop(rusle_k_25km,  basin_poly), basin_poly)
+  ls_masked <- mask(crop(rusle_ls_25km, basin_poly), basin_poly)
+  r_masked  <- mask(crop(rusle_r_25km,  basin_poly), basin_poly)
+  
+  tibble(
+    C_factor  = global(c_masked,  "mean", na.rm = TRUE)$mean,
+    K_factor  = global(k_masked,  "mean", na.rm = TRUE)$mean,
+    LS_factor = global(ls_masked, "mean", na.rm = TRUE)$mean,
+    R_factor  = global(r_masked,  "mean", na.rm = TRUE)$mean
+  )
+}
+
+unique_rusle <- main_basins %>%
+  mutate(
+    rusle = map(1:n(), ~ calculate_rusle_factors(main_basins[.x, ]))
+  ) %>%
+  unnest(rusle) %>%
+  st_drop_geometry() %>%
+  select(ID, C_factor, K_factor, LS_factor, R_factor)
+
+rm(rusle_c_25km, rusle_k_25km, rusle_ls_25km, rusle_r_25km, calculate_rusle_factors)
+gc()
+
+write_csv(unique_rusle, "E:/POC research/data/5_Prediction/Spatial/Features/soilerosion.csv")
+```
+
+```{r Constant: Lithology}
+cat("\n==== Calculating Lithology Factors ====\n")
+
+# read files
+litho_tif_file <- "E:/POC research/data/2_Lithology/dztp_08022024_ras.tif"  
+litho_mapping_file <- "E:/POC research/data/2_Lithology/DIC_lithology_en.xlsx"
+litho_rast <- safe_read(litho_tif_file) |> project(crs_sf)
+litho_map <- read_excel(litho_mapping_file)
+litho_types <- setNames(litho_map$Code, litho_map$Lithology)
+
+# function
+calculate_lithology <- function(basin_poly) {
+  # align raster
+  rast_proj <- project(litho_rast, crs(basin_poly))
+  rast_crop <- crop(rast_proj, basin_poly)
+  rast_mask <- mask(rast_crop, basin_poly)
+  
+  # percentage
+  res <- map_dbl(names(litho_types), function(name) {
+    code <- litho_types[[name]]
+    global(rast_mask == code, "mean", na.rm = TRUE)$mean
+  })
+  
+  tibble(!!!set_names(as.list(res), names(litho_types)))
+}
+
+# map function to extract lithology features
+unique_litho <- main_basins %>%
+  mutate(
+    litho = map(1:n(), ~ calculate_lithology(main_basins[.x, ]))
+  ) %>%
+  unnest(litho) %>%
+  st_drop_geometry() %>%
+  select(ID, all_of(names(litho_types)))
+
+# results
+print(head(unique_litho))
+rm(litho_types, litho_map, litho_rast)
+
+write_csv(unique_litho, "E:/POC research/data/5_Prediction/Spatial/Features/lithology.csv")
+```
+
+```{r Constant: Reservoirs_Dams}
+cat("\n==== Extracting Reservoir and Dam Features (Point-level & Basin-level) ====\n")
+
+# Load dam shapefile and preprocess - replace -99 with NA
+reservoirs_dams <- st_read(paths$reservoirs_dams)
+replace_neg99_with_na_sf <- function(sf_obj) {
+  attrs <- st_drop_geometry(sf_obj)
+  attrs[] <- lapply(attrs, function(x) {
+    if (is.numeric(x)) x[x == -99] <- NA
+    x
+  })
+  st_as_sf(cbind(attrs, st_geometry(sf_obj)))
+}
+reservoirs_dams <- replace_neg99_with_na_sf(reservoirs_dams)
+
+# Ensure CRS consistency with outlet points
+points <- st_transform(points, st_crs(reservoirs_dams))
+main_basins_proj <- st_transform(main_basins, st_crs(reservoirs_dams))
+
+# ----- Basin-level function: Summary statistics of dams within polygon -----
+calculate_summary_statistics <- function(dams_sub) {
+  dams_sub %>%
+    st_drop_geometry() %>%
+    summarize(
+      Num_Dams        = n(),
+      Avg_DamHeight_m = mean(DAM_HGT_M, na.rm = TRUE),  # 平均大坝高度
+      Max_DamHeight_m = max(DAM_HGT_M, na.rm = TRUE),   # 最大大坝高度
+      Avg_CatchmentArea_km2 = mean(CATCH_SKM, na.rm = TRUE),  # 平均集水面积
+      Sum_CatchmentArea_km2 = sum(CATCH_SKM, na.rm = TRUE),   # 总集水面积
+      Avg_Depth_m = mean(DEPTH_M, na.rm = TRUE),              # 平均深度
+      Sum_Depth_m = sum(DEPTH_M, na.rm = TRUE),               # 总深度
+      Avg_Capacity_Mm3 = mean(CAP_MCM, na.rm = TRUE),   # 平均水库容量
+      Sum_Capacity_Mm3 = sum(CAP_MCM, na.rm = TRUE),    # 总水库容量
+      Avg_Discharge_ls = mean(DIS_AVG_LS, na.rm = TRUE),      # 平均流量
+      Sum_Discharge_ls = sum(DIS_AVG_LS, na.rm = TRUE),       # 总流量
+      Avg_DOR_pc = mean(DOR_PC, na.rm = TRUE)                 # 调节度指数
+    )
+}
+
+# ----- Point-level function: Distance to nearest dam (skip NA attributes) -----
+calculate_nearest_dam_features <- function(point_geom, dams_sub) {
+  distances <- st_distance(point_geom, dams_sub)
+  dams_sub$distance_km <- as.numeric(distances) / 1000  # add distance column
+  
+  # Sort dams by distance
+  dams_ordered <- dams_sub[order(dams_sub$distance_km), ]
+  
+  # Find first dam with non-NA values in desired fields
+  for (i in seq_len(nrow(dams_ordered))) {
+    dam <- dams_ordered[i, ]
+    
+    # You can define more sophisticated rules if needed
+    if (!is.na(dam$DAM_HGT_M) && !is.na(dam$CAP_REP)) {
+      return(
+        tibble(
+          Nearest_Dam_Height_m        = dam$DAM_HGT_M,
+          Nearest_CatchmentArea_km2   = dam$CATCH_SKM,
+          Nearest_Depth_m             = dam$DEPTH_M,
+          Nearest_Capacity_Mm3        = dam$CAP_REP,
+          Nearest_Discharge_ls        = dam$DIS_AVG_LS,
+          Nearest_DOR_pc              = dam$DOR_PC,
+          Distance_to_Nearest_Dam_km  = dam$distance_km
+        )
+      )
+    }
+  }
+  
+  # If no suitable dam is found (all relevant fields are NA), return 0
+  return(tibble(
+    Nearest_Dam_Height_m        = 0,
+    Nearest_CatchmentArea_km2   = 0,
+    Nearest_Depth_m             = 0,
+    Nearest_Capacity_Mm3        = 0,
+    Nearest_Discharge_ls        = 0,
+    Nearest_DOR_pc              = 0,
+    Distance_to_Nearest_Dam_km  = 0
+  ))
+}
+
+# ===== Basin-level summary: for each basin polygon =====
+basin_dam_summary <- purrr::map_dfr(1:nrow(main_basins_proj), function(i) {
+  basin_poly <- main_basins_proj[i, ]
+  ID   <- basin_poly$ID
+  
+  dams_in_basin <- reservoirs_dams[st_intersects(reservoirs_dams, basin_poly, sparse = FALSE), ]
+  
+  if (nrow(dams_in_basin) > 0) {
+    stats <- calculate_summary_statistics(dams_in_basin)
+  } else {
+    stats <- tibble(
+      Num_Dams         = 0,
+      Avg_DamHeight_m  = 0
+    )
+  }
+  
+  bind_cols(tibble(ID = ID), stats)
+})
+
+# ===== Point-level summary: for each outlet =====
+point_dam_features <- purrr::map_dfr(1:nrow(points), function(i) {
+  outlet <- points[i, ]
+  outlet_id <- outlet$ID
+  
+  # Find dams in corresponding basin polygon
+  basin_poly <- main_basins_proj[main_basins_proj$ID == outlet_id, ]
+  dams_in_basin <- reservoirs_dams[st_intersects(reservoirs_dams, basin_poly, sparse = FALSE), ]
+  
+  if (nrow(dams_in_basin) > 0) {
+    nearest_stats <- calculate_nearest_dam_features(outlet, dams_in_basin)
+  } else {
+    nearest_stats <- tibble(
+      Nearest_Dam_Height_m     = 0
+    )
+  }
+  
+  bind_cols(
+    tibble(ID = outlet$ID),
+    nearest_stats
+  )
+})
+
+# Clean up
+rm(reservoirs_dams, calculate_summary_statistics, calculate_nearest_dam_features)
+gc()
+
+write_csv(point_dam_features, "E:/POC research//data/5_Prediction//Spatial/Features/RanD_point.csv")
+write_csv(basin_dam_summary, "E:/POC research//data/5_Prediction//Spatial/Features/RanD_basin.csv")
+```
+
+```{r Temporal: precipitation}
+
+cat("\n==== Preparing ERA5 Precipitation (mm/month) ====\n")
+
+# read ERA5 nc 
+ppt <- nc_open(paths$precipitation_nc)
+ppt_raw  <- ncvar_get(ppt,  "tp")          # (lon,lat,time)
+lon_ppt  <- ncvar_get(ppt,  "longitude")
+lat_ppt  <- ncvar_get(ppt,  "latitude")
+time_ppt <- ncvar_get(ppt,  "time")        # hours since 1900‑01‑01
+fill_ppt <- ncatt_get(ppt, "tp", "_FillValue")$value
+nc_close(ppt)
+
+# convert to mm/month
+ppt_raw[ppt_raw == fill_ppt] <- NA
+ppt_raw <- ppt_raw * 1000                 # m  ->  mm
+
+time_vec <- as.POSIXct(time_ppt * 3600, origin = "1900-01-01", tz = "GMT")
+
+# helper: number of days in each ERA5 month
+days_month <- function(x) {
+  y <- format(x, "%Y"); m <- as.integer(format(x, "%m"))
+  as.integer(format(as.Date(paste0(y,"-",m%%12+1,"-01"))-1, "%d"))
+}
+ppt_raw <- sweep(ppt_raw, 3, sapply(time_vec, days_month), `*`)  # mm/day → mm/month
+ppt_raw <- aperm(ppt_raw, c(2,1,3))                             # (lat,lon,time)
+
+r_ppt <- rast(
+  ppt_raw,
+  extent = ext(range(lon_ppt), range(lat_ppt)),
+  crs = "EPSG:4326"
+)
+time(r_ppt) <- time_vec
+
+# project to crs_sf
+crs_sf <- st_crs(main_basins)$wkt
+r_ppt <- project(r_ppt, crs_sf, method = "bilinear")
+
+# extraction function
+get_month_mean <- function(basin_poly, year_month, cube, tvec) {
+  idx <- which(format(tvec, "%Y-%m") == year_month)
+  if (length(idx)==0) return(NA_real_)
+  
+  masked <- mask(crop(cube[[idx]], basin_poly), basin_poly)
+  global(masked, "mean", na.rm = TRUE)$mean
+}
+
+# iterate over (ID, time)
+precip_results <- points_data %>%
+  mutate(
+    Precipitation = purrr::pmap_dbl(
+      list(ID, time),
+      \(bid, date)
+        get_month_mean(
+          basin_poly = main_basins[main_basins$ID == bid, ],
+          year_month = format(date, "%Y-%m"),
+          cube = r_ppt, tvec = time_vec)
+    )
+  ) |>
+  select(ID, time, Precipitation)
+rm(ppt_raw)
+gc()
+
+write_csv(precip_results, "E:/POC research/data/5_Prediction/Spatial/Features/prec.csv")
+```
+
+```{r Temporal: Temprature}
+
+cat("\n==== Preparing ERA5 Air Temperature (°C) ====\n")
+
+tmp <- nc_open(paths$temperature_nc)
+tmp_raw <- ncvar_get(tmp, "t2m")
+lon_tmp <- ncvar_get(tmp, "longitude")
+lat_tmp <- ncvar_get(tmp, "latitude")
+time_tmp<- ncvar_get(tmp, "time")
+fill_tmp<- ncatt_get(tmp,"t2m","_FillValue")$value
+nc_close(tmp)
+
+tmp_raw[tmp_raw == fill_tmp] <- NA
+tmp_raw <- tmp_raw - 273.15           # K → °C
+time_vec_t <- as.POSIXct(time_tmp*3600, origin="1900-01-01", tz="GMT")
+tmp_raw <- aperm(tmp_raw, c(2,1,3))
+
+r_tmp <- rast(
+  tmp_raw,
+  extent = ext(range(lon_tmp), range(lat_tmp)),
+  crs = "EPSG:4326"
+)
+time(r_tmp) <- time_vec_t
+
+# project to crs_sf
+crs_sf <- st_crs(main_basins)$wkt
+r_tmp <- project(r_tmp, crs_sf, method = "bilinear")
+
+get_month_tmp <- function(basin_poly, year_month, cube, tvec){
+  idx <- which(format(tvec, "%Y-%m")==year_month)
+  if (length(idx)==0) return(NA_real_)
+  r <- cube[[idx]]
+  val <- terra::extract(r, basin_poly, fun = mean, na.rm = TRUE)
+  print(val[1,2])
+  return(val[1,2])
+}
+
+temp_results <- points_data %>%
+  mutate(
+    Temperature = purrr::pmap_dbl(
+      list(ID, time),
+      \(bid, date)
+        get_month_tmp(
+          basin_poly = main_basins[main_basins$ID == bid, ],
+          year_month = format(date, "%Y-%m"),
+          cube = r_tmp, tvec = time_vec_t)
+    )
+  ) |>
+  select(ID, time, Temperature)
+rm(tmp_raw)
+gc()
+
+write_csv(temp_results, "E:/POC research/data/5_Prediction/Spatial/Features/temp.csv")
+```
+
+```{r Temporal: NDVI}
+
+ndvi_yearly_dir <- "E:/POC research/data/2_MODIS_indices/NDVI_yearly"
+ndvi_files <- list.files(ndvi_yearly_dir, pattern = "NDVI_\\d{4}\\.tif$", full.names = TRUE)
+ndvi_years <- as.integer(gsub(".*NDVI_(\\d{4})\\.tif$", "\\1", ndvi_files))
+
+# build ndvi_stack
+ndvi_stack <- rast(ndvi_files[order(ndvi_years)])
+if (terra::crs(ndvi_stack) != crs_sf) {
+  ndvi_stack <- terra::project(ndvi_stack, crs_sf)
+}
+
+ndvi_years <- sort(ndvi_years)
+
+# extract function
+mean_ndvi <- function(poly, yr) {
+  idx <- match(yr, ndvi_years)
+  if (is.na(idx)) return(NA_real_)
+  val <- terra::extract(ndvi_stack[[idx]], poly, fun = mean, na.rm = TRUE)
+  return(val[1,2])
+}
+
+# map function
+ndvi_results <- points_data |>
+  mutate(
+    NDVI = purrr::pmap_dbl(
+      list(ID, Year),
+      \(bid, yr) mean_ndvi(main_basins[main_basins$ID == bid, ], yr)
+    )) |>
+  select(ID, time, NDVI)
+
+rm(ndvi_stack)
+gc()
+
+write_csv(ndvi_results, "E:/POC research/data/5_Prediction/Spatial/Features/NDVI.csv")
+```
+
+```{r Temporal: NPP}
+cat("\n==== Computing MODIS‑NPP (2001‑2022) ====\n")
+
+npp_files <- list.files(paths$npp_dir, "*_new.tif$", full.names = TRUE)
+npp_years <- 2001:(2001 + length(npp_files) - 1)
+
+npp_stack <- purrr::map(npp_files, terra::rast) |>
+             purrr::map(~ project(.x, crs_sf))
+
+mean_npp <- function(poly, yr) {
+  idx <- match(yr, npp_years)
+  if (is.na(idx)) return(NA_real_)
+  
+  val <- terra::extract(npp_stack[[idx]], poly, fun = mean, na.rm = TRUE)
+  
+  return(val[1,2])
+}
+
+npp_results <- points_data |>
+  mutate(
+    NPP = purrr::pmap_dbl(
+      list(ID, Year),
+      \(bid, yr) mean_npp(main_basins[main_basins$ID == bid, ], yr)
+    )
+  ) |>
+  select(ID, time, NPP)
+rm(npp_stack)
+gc()
+
+write_csv(npp_results, "E:/POC research/data/5_Prediction/Spatial/Features/NPP.csv")
+```
+
+```{r Temporal: LandCover}
+cat("\n==== Computing land‑cover fractions ====\n")
+# plan(multisession, workers = 10)
+
+## 1.  Read / align every annual land‑cover TIF into a list     
+lc_files <- list.files(paths$landcover_dir, "_1.tif$", full.names = TRUE)
+
+# replicate 1985 file 4× to 1985-1989
+f1985 <- grep("1985_1.tif$", lc_files, value = TRUE)
+if (length(f1985) == 1)
+  lc_files <- c(rep(f1985, 5), setdiff(lc_files, f1985))
+
+years_lc <- 1985:(1985 + length(lc_files) - 1)
+
+message(sprintf("Land‑cover years: %d–%d", min(years_lc), max(years_lc)))
+
+lc_stack <- purrr::map(lc_files, terra::rast) |>
+             purrr::map(~ project(.x, crs_sf, method = "near"))
+
+class_codes <- c(
+  Cropland  = 1, Forest = 2, Shrub = 3, Grassland = 4,
+  Water     = 5, Snow_Ice = 6, Barren   = 7, Urban = 8, Wetland = 9
+)
+
+## 2.  Helper: fraction of class code (1–9) in a polygon & year     
+lc_fraction <- function(poly, year) {
+  idx <- match(year, years_lc)
+  if (is.na(idx)) return(setNames(rep(NA_real_, length(class_codes)), names(class_codes)))
+  
+  vals <- terra::extract(lc_stack[[idx]], poly)[, -1]
+  stats <- sapply(class_codes, function(code) {
+    mean(vals == code, na.rm = TRUE)
+  })
+  names(stats) <- names(class_codes)
+  rm(r)
+  gc()
+  return(stats)
+}
+
+## 3.  Loop across (ID, year) to build result table    
+landcover_results <- points_data |>
+  mutate(
+    lc_props = purrr::map2(
+      ID, Year,
+      \(bid, yr) {
+        poly <- main_basins[main_basins$ID == bid, ]
+        lc_fraction(poly, yr)
+      },
+      .progress = TRUE
+    )
+  ) |>
+  tidyr::unnest_wider(lc_props) |>
+  select(ID, time, 
+         Cropland, Forest, Shrub, Grassland, Water, Snow_Ice, Barren, Urban, Wetland)
+
+rm(lc_stack)
+gc()
+
+write_csv(landcover_results, "E:/POC research/data/5_Prediction/Spatial/Features/landcover.csv")
+```
+
+```{r xxx landcover quick}
+# # 1. Read and align annual land-cover files into a single stack
+# lc_files <- list.files(paths$landcover_dir, "_1.tif$", full.names = TRUE)
+# 
+# # extract year numbers from filenames (e.g. "...1985_1.tif")
+# years_in_files <- as.integer(stringr::str_match(basename(lc_files), "(\\d{4})_1.tif")[,2])
+# 
+# # order files by extracted year
+# ord <- order(years_in_files)
+# lc_files <- lc_files[ord]
+# years_in_files <- years_in_files[ord]
+# 
+# # replicate 1985 file 5× (1985–1989)
+# f1985 <- which(years_in_files == 1985)
+# if (length(f1985) == 1) {
+#   lc_files <- c(rep(lc_files[f1985], 5), lc_files[-f1985])
+#   years_in_files <- c(1985:1989, years_in_files[-f1985])
+# }
+# 
+# years_lc <- years_in_files
+# message(sprintf("Land-cover years: %d–%d", min(years_lc), max(years_lc)))
+# 
+# # load all rasters into a stack
+# lc_stack <- terra::rast(lc_files)
+# lc_stack <- terra::project(lc_stack, crs_sf, method = "near")
+# 
+# class_codes <- c(
+#   Cropland  = 1, Forest = 2, Shrub = 3, Grassland = 4,
+#   Water     = 5, Snow_Ice = 6, Barren = 7, Urban = 8, Wetland = 9
+# )
+# 
+# ## 2. Function: compute land-cover proportions for one year
+# get_year_props <- function(rast_year, year, polys, class_codes) {
+#   vals <- terra::extract(rast_year, polys, ID = TRUE)
+#   vals$ID <- polys$ID[vals$ID]
+#   
+#   dplyr::as_tibble(vals) |>
+#     dplyr::filter(!is.na(layer)) |>           # drop NA pixels
+#     dplyr::group_by(ID, lc_code = layer) |>
+#     dplyr::summarise(n_pix = dplyr::n(), .groups = "drop_last") |>
+#     dplyr::mutate(
+#       frac = n_pix / sum(n_pix),              # proportion over non-NA pixels
+#       Year = year
+#     ) |>
+#     tidyr::pivot_wider(
+#       names_from = lc_code,
+#       values_from = frac,
+#       values_fill = 0
+#     ) |>
+#     dplyr::rename_with(
+#       ~ names(class_codes)[match(as.integer(.x), class_codes)],
+#       .cols = as.character(class_codes)
+#     )
+# }
+# 
+# ## 3. Loop over all years and combine results
+# landcover_results <- purrr::map2_dfr(
+#   terra::slices(lc_stack, "bands"),   # extract each year raster as single-layer
+#   years_lc,
+#   ~ get_year_props(.x, .y, main_basins, class_codes)
+# )
+# 
+# ## 4. Join back to points_data if needed
+# landcover_results <- dplyr::left_join(
+#   points_data,
+#   landcover_results,
+#   by = c("ID", "Year")
+# ) |>
+#   dplyr::select(ID, Year, all_of(names(class_codes)))
+# 
+# ## 5. (Optional) Check that proportions per polygon-year sum to ~1
+# check_sums <- landcover_results |>
+#   dplyr::mutate(total = rowSums(dplyr::across(all_of(names(class_codes)))))
+# summary(check_sums$total)
+
+```
+
+```{r Temporal: Soil-loss}
+cat("\n==== Computing basin soil‑loss ====\n")
+
+
+sl_2001 <- rast(paths$soilloss_2001) |> project(crs_sf)
+sl_2012 <- rast(paths$soilloss_2012) |> project(crs_sf)
+
+soil_loss <- function(poly, yr) {
+  r <- if (yr < 2012) sl_2001 else sl_2012
+  masked <- terra::mask(terra::crop(r, poly), poly)
+  val = terra::global(masked, "mean", na.rm = TRUE)$mean
+  
+  rm(masked)
+  gc()
+  
+  return(val)
+}
+
+soilloss_results <- points_data |>
+  mutate(
+    SoilLoss = purrr::pmap_dbl(
+      list(ID, Year),
+      \(bid, yr) soil_loss(main_basins[main_basins$ID == bid, ], yr)
+    )
+  ) |>
+  select(ID, time, SoilLoss)
+
+rm(sl_2001, sl_2012)
+gc()
+
+write_csv(soilloss_results, "E:/POC research/data/5_Prediction/Spatial/Features/soilloss.csv")
+```
+
+```{r Temporal: GDP}
+cat("\n==== Computing basin GDP (1990‑2015) ====\n")
+
+tif_files <- list.files(paths$gdp_dir, "\\.tif$", full.names = TRUE)
+years_gdp <- 1990:2015
+
+gdp_stack <- purrr::map(tif_files, terra::rast) |>
+  purrr::map(~ project(.x, crs_sf))
+
+# helper ─ polygon sum
+get_gdp <- function(basin_poly, yr) {
+  if (yr>=2015) {yr = 2015}
+  idx <- match(yr, years_gdp)
+  if (is.na(idx)) return(NA_real_)
+  masked <- terra::mask(terra::crop(gdp_stack[[idx]], basin_poly), basin_poly)
+  terra::global(masked, "sum", na.rm = TRUE)$sum  
+}
+
+gdp_results <- points_data |>
+  filter(Year > 2015) |>
+  mutate(
+    GDP = purrr::pmap_dbl(
+      list(ID, Year),
+      \(bid, yr) get_gdp(main_basins[main_basins$ID == bid, ], yr)
+    )
+  ) |>
+  select(ID, time, GDP)
+  
+rm(gdp_stack)
+gc()
+
+gdp_results <- read_csv("E:/POC research/data/5_Prediction/Spatial/Features/gdp.csv")
+
+gdp_results <- gdp_results |>
+  rows_update(gdp_new, by = c("ID", "time"))
+
+write_csv(gdp_results, "E:/POC research/data/5_Prediction/Spatial/Features/gdp.csv")
+```
+
+```{r Temporal: Population Density}
+cat("\n==== Computing basin‑level population density ====\n")
+
+## 1.  read & prepare each ADF (popYYYY/tpopYYYY/w001001.adf)  
+target_years <- 1990:2020
+adf_dirs <- file.path(paths$pop_base_dir,
+                      paste0("pop", target_years, "/tpop", target_years))
+valid_idx  <- file.exists(file.path(adf_dirs, "w001001.adf"))
+adf_dirs   <- adf_dirs[valid_idx]
+pop_years  <- target_years[valid_idx]
+
+stopifnot(length(adf_dirs) > 0)
+
+read_pop <- function(adf_dir) {
+  y  <- gsub(".*pop(\\d{4}).*", "\\1", adf_dir) |> as.integer()
+  r0 <- terra::rast(file.path(adf_dir, "w001001.adf"))
+  
+  nodata_val <- -2147483648 
+  r0[r0 == nodata_val] <- NA
+  
+  pop_crs <- terra::crs(r0, proj = TRUE)
+  basin_crs <- terra::crs(main_basins, proj = TRUE)
+
+  if (pop_crs != basin_crs) {
+    r0 <- terra::project(r0, basin_crs, method = "near")
+  }
+
+  names(r0) <- y
+  return(r0)
+}
+
+pop_stack <- purrr::map(adf_dirs, read_pop)
+names(pop_stack) <- pop_years      # easy look‑up later
+
+# cell area
+template_r <- pop_stack[[1]]
+cell_area  <- terra::cellSize(template_r, unit = "km")
+
+# 2. Generate "pop density raster"
+make_density_raster <- function(r) {
+  pop_sum <- r
+  area    <- terra::resample(cell_area, r, method = "near")
+  pop_density <- pop_sum / area
+  return(pop_density)
+}
+
+density_stack <- lapply(pop_stack, make_density_raster)
+names(density_stack) <- names(pop_stack)
+
+# 3. yearly zonal mean
+all_results <- list()
+
+for (yr in names(density_stack)) {
+  dens_r <- density_stack[[yr]]
+  vals <- terra::extract(dens_r, main_basins, fun = mean, na.rm = TRUE)
+  df <- tibble(ID = main_basins$ID, time = as.integer(yr), Pop_density = vals[,2])
+  all_results[[yr]] <- df
+}
+
+# 4. merge + points_data join
+all_df <- bind_rows(all_results)
+
+final_df <- points_data %>%
+  left_join(all_df, by = c("ID", "Year" = "time"))
+
+# 5. output
+write_csv(final_df, output_file)
+```
+
+```{r Temporal: Population}
+# cat("\n==== Computing basin‑level population density ====\n")
+# 
+# ## 1.  read & prepare each ADF (popYYYY/tpopYYYY/w001001.adf)  
+# target_years <- 1990:2020
+# adf_dirs <- file.path(paths$pop_base_dir,
+#                       paste0("pop", target_years, "/tpop", target_years))
+# valid_idx  <- file.exists(file.path(adf_dirs, "w001001.adf"))
+# adf_dirs   <- adf_dirs[valid_idx]
+# pop_years  <- target_years[valid_idx]
+# 
+# stopifnot(length(adf_dirs) > 0)
+# 
+# read_pop <- function(adf_dir) {
+#   y  <- gsub(".*pop(\\d{4}).*", "\\1", adf_dir) |> as.integer()
+#   r0 <- terra::rast(file.path(adf_dir, "w001001.adf"))
+#   
+#   nodata_val <- -2147483648 
+#   r0[r0 == nodata_val] <- NA
+#   
+#   pop_crs <- terra::crs(r0, proj = TRUE)
+#   basin_crs <- terra::crs(main_basins, proj = TRUE)
+# 
+#   if (pop_crs != basin_crs) {
+#     r0 <- terra::project(r0, basin_crs, method = "near")
+#   }
+# 
+#   names(r0) <- y
+#   return(r0)
+# }
+# 
+# pop_stack <- purrr::map(adf_dirs, read_pop)
+# names(pop_stack) <- pop_years      # easy look‑up later
+# 
+# ## 2.  helper: mean population density for a basin polygon + year
+# pop_density_mean <- function(poly, year) {
+#   r <- pop_stack[[as.character(year)]]
+#   if (is.null(r)) return(NA_real_)
+#   
+#   # area of each cell (km²) in lat/long grid
+#   cell_area <- terra::cellSize(r, unit = "km")
+#   
+#   masked_pop  <- terra::mask(terra::crop(r,   poly), poly)
+#   masked_area <- terra::mask(terra::crop(cell_area, poly), poly)
+#   
+#   pop_sum  <- terra::global(masked_pop,  "sum",  na.rm = TRUE)$sum
+#   area_sum <- terra::global(masked_area, "sum",  na.rm = TRUE)$sum 
+#   val <- pop_sum / area_sum
+#   
+#   rm(masked_pop, cell_area, masked_area)
+#   gc()
+#   
+#   return(val)
+# }
+# 
+# ## 3.  vectorised over points_data (ID, year)   
+# output_file <- "E:/POC research/data/5_Prediction/Spatial/Features/pop.csv"
+# 
+# # CSV header
+# write_csv(tibble(ID=integer(), time=integer(), Pop_density=double()), output_file)
+# 
+# for (i in seq_len(nrow(points_data))) {
+#   row <- points_data[i, ]
+#   poly <- main_basins[main_basins$ID == row$ID, ]
+#   pop_val <- pop_density_mean(poly, row$Year)
+#   
+#   out_row <- tibble(ID = row$ID, time = row$Year, Pop_density = pop_val)
+#   
+#   write_csv(out_row, output_file, append = TRUE)
+#   
+#   if (i %% 100 == 0) cat("Processed", i, "of", nrow(points_data), "rows\n")
+# }
+# 
+# rm(pop_stack)
+# gc()
+
+```
+
+```{r Temporal: Reservoirs_Dams}
+cat("\n==== Computing time‑window dam counts ====\n")
+
+reservoirs_dams <- st_read(paths$reservoirs_dams) |> st_make_valid() |>
+  st_transform(crs_sf)
+
+dam_counts <- function(poly, yr) {
+  dams <- reservoirs_dams[st_intersects(reservoirs_dams, poly, sparse = FALSE), ]
+  tibble(
+    Num_Dams_10yr = sum(dams$YEAR >= yr - 10, na.rm = TRUE),
+    Num_Dams_20yr = sum(dams$YEAR >= yr - 20, na.rm = TRUE),
+    Num_Dams_30yr = sum(dams$YEAR >= yr - 30, na.rm = TRUE),
+    Num_Dams_40yr = sum(dams$YEAR >= yr - 40, na.rm = TRUE),
+    Num_Dams_50yr = sum(dams$YEAR >= yr - 50, na.rm = TRUE)
+  )
+}
+
+resdam_temporal_results <- points_data |>
+  mutate(
+    dam_stats = purrr::pmap(
+      list(ID, Year),
+      \(bid, yr) dam_counts(main_basins[main_basins$ID == bid, ], yr)
+    )
+  ) |>
+  unnest(dam_stats) |>
+  select(ID, time, 
+         Num_Dams_10yr, Num_Dams_20yr, Num_Dams_30yr, Num_Dams_40yr, Num_Dams_50yr)
+
+write_csv(resdam_temporal_results, "E:/POC research/data/5_Prediction/Spatial/Features/RanD_time.csv")
+```
+
+```{r Combine Data}
+cat("\n==== Aggregating all constant factors ====\n")
+
+root_path <- "E:/POC research/data/5_Prediction/Spatial/Features"
+# Prepare dataframe
+basin_vars <- list(
+  read_csv(file.path(root_path, "slope.csv")),
+  read_csv(file.path(root_path, "upSlope.csv")),
+  read_csv(file.path(root_path, "area.csv")),
+  read_csv(file.path(root_path, "soilsource.csv")),
+  read_csv(file.path(root_path, "litter.csv")),
+  read_csv(file.path(root_path, "soilerosion.csv")),
+  read_csv(file.path(root_path, "lithology.csv")),
+  read_csv(file.path(root_path, "RanD_point.csv")),
+  read_csv(file.path(root_path, "RanD_basin.csv"))
+) %>%
+  reduce(left_join, by = "ID")
+
+static_vars <- basin_vars %>%
+    mutate(across(
+    where(is.numeric),
+    ~ replace(.x, is.na(.x) | is.infinite(.x), 0)  # replace NA and Inf/-Inf with 0
+  ))
+
+write_xlsx(static_vars,
+  "E:/POC research/data/5_Prediction/Spatial/Static_Features.xlsx")
+
+# combine temporal variables 
+temporal_vars <- list(
+  read_csv(file.path(root_path, "NDVI.csv")),
+  read_csv(file.path(root_path, "NPP.csv")),
+  read_csv(file.path(root_path, "prec.csv")),
+  read_csv(file.path(root_path, "temp.csv")),
+  read_csv(file.path(root_path, "landcover.csv")),
+  read_csv(file.path(root_path, "soilloss.csv")),
+  read_csv(file.path(root_path, "gdp.csv")),
+  read_csv(file.path(root_path, "pop.csv"))%>%
+    mutate(time = as.Date(time)),
+  read_csv(file.path(root_path, "RanD_time.csv"))
+) %>%
+  reduce(left_join, by = c("ID","time"))
+
+write_xlsx(temporal_vars,
+  "E:/POC research/data/5_Prediction/Spatial/Temporal_Features.xlsx")
+```
+
+```{r }
+# combine all data
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(writexl)
+library(lubridate)
+
+static_vars <- read_excel("E:/POC research/data/5_Prediction/Spatial/Static_Features.xlsx")
+temporal_vars <- read_excel("E:/POC research/data/5_Prediction/Spatial/Temporal_Features.xlsx")
+
+# combine static and temporal vars
+point_time_grid <- static_vars %>% 
+  distinct(ID) %>% 
+  inner_join(temporal_vars %>% distinct(ID, time), by = "ID")
+
+point_timeseries <- point_time_grid %>% 
+  mutate(
+  Year  = lubridate::year(time),
+  Month = lubridate::month(time)
+  ) %>%
+  # static: ID
+  left_join(static_vars,   by = c("ID")) %>% 
+  # temporal: (ID, time)
+  left_join(temporal_vars, by = c("ID", "time")) %>% 
+  relocate(ID, time, Year, Month)              
+
+# export
+write_xlsx(
+  point_timeseries,
+  "E:/POC research/data/5_Prediction/Spatial/Input_Features.xlsx"
+)
+```
+
+```{r Add Water Discharge}
+
+library(ncdf4)
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(writexl)
+library(sf)
+
+stations <- read_excel("E:/POC research/data/5_Prediction/Spatial/Input_Features.xlsx") %>%
+  mutate(ID = as.character(ID),
+         Date = as.Date(time))
+
+# 将站点表格转换为空间点对象
+points_sf <- st_read(paths$points_shp)
+coords <- st_coordinates(points_sf) 
+points_df <- cbind(st_drop_geometry(points_sf), coords)
+
+stations <- stations %>%
+  left_join(points_df %>% select(ID, X, Y), by = "ID") 
+
+stations_sf <- st_as_sf(stations, coords = c("X", "Y"), crs = st_crs(points_sf))
+
+# 读取 shapefile 文件，获取河流段及其 rivid
+shp_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\MERIT_Basins_v0.7\\level_01_v0.7\\pfaf_04_riv_3sMERIT.shp"
+river_shp <- st_read(shp_file) %>%
+  st_transform(st_crs(points_sf))
+
+# 进行空间匹配，找到每个站点最近的河流段（nearest feature）
+stations$station_rivid <- st_nearest_feature(stations_sf, river_shp)
+
+# 创建一个函数来找到最近的时间索引
+find_nearest_time_index <- function(date, time_dates) {
+  return(which.min(abs(time_dates - date)))
+}
+
+# 初始化一个新的列来存储填补的流量数据
+stations$`Water_discharge(m3/s)` <- NA
+
+# 读取 GRADES 文件
+nc_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\GRADES\\GRADES_hydroDL_V2.0_pfaf_04_19800101_20230930.nc"
+nc_data <- nc_open(nc_file)
+
+# 获取所有时间点
+time <- ncvar_get(nc_data, "time")
+origin <- as.Date("1979-01-01")  # 时间从 1979-01-01 开始
+time_dates <- origin + days(time)
+
+stations$`Water_discharge(m3/s)` <- NA
+
+# 循环每一条记录
+for (i in 1:nrow(stations)) {
+  # 获取当前记录的年份、月份和 rivid
+  current_year <- stations$Year[i]
+  current_month <- stations$Month[i]
+  current_rivid <- stations$station_rivid[i]
+  
+  # 找到该月份的所有天数
+  month_start <- as.Date(paste(current_year, current_month, "01", sep = "-"))
+  month_end <- ceiling_date(month_start, "month") - days(1)
+  
+  # 找到该月份在时间序列中的索引范围
+  month_indices <- which(time_dates >= month_start & time_dates <= month_end)
+  
+  if (length(month_indices) > 0) {
+    # 读取该月份所有天的流量数据
+    discharge_values <- ncvar_get(nc_data, "Qout", 
+                                 start = c(current_rivid, min(month_indices)), 
+                                 count = c(1, length(month_indices)))
+    
+    # 计算月平均流量
+    monthly_avg_discharge <- mean(discharge_values, na.rm = TRUE)
+    
+    # 将月平均流量值补充到相应位置
+    stations$`Water_discharge(m3/s)`[i] <- monthly_avg_discharge
+  } else {
+    warning(paste("No data found for", month_start, "to", month_end))
+  }
+}
+
+# 关闭 nc 文件
+nc_close(nc_data)
+
+write_xlsx(stations, "E:/POC research/data/5_Prediction/Spatial/Input_Features.xlsx")
+
+```

@@ -1,0 +1,1318 @@
+---
+title: "Pipeline_Outlets"
+output: html_document
+date: "2025-04-30"
+---
+
+```{r Packages and Directory}
+# Packages 
+library(terra)
+library(readxl)
+library(dplyr)
+library(purrr)
+library(readr)
+library(writexl)
+library(tidyr)
+library(ncdf4)
+library(sp)
+library(sf)
+
+# Directory
+root_dir <- "E:/POC research/data"
+
+paths <- list(
+  # basic data
+  outlets_shp       = file.path(root_dir, "POC_basic data/outlets/outlets.shp"),  
+  times_data        = file.path(root_dir, "POC_basic data/time.xlsx"),           
+  main_basins_shp   = file.path(root_dir, "POC_basic data/watershed_merged/merged_watershed.shp"),
+
+  # variables rawdata
+  dem       = file.path(root_dir, "1_DEM_watershed/SRTM/SRTM_dem_90m.tif"),
+  rh_file   = file.path(root_dir, "2_Litter_Rh/Rh_RF_ensemble_mean_1982_2018.tif"),
+  litter_file       = file.path(root_dir, "2_Litter_Rh/litter_360_720.tif"),
+
+  soil = list(
+    clay            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__CLAY.tif"),
+    sand            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__SAND.tif"),
+    silt            = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__SILT.tif"),
+    organic_carbon  = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__ORG_CARBON.tif"),
+    root_depth      = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__ROOT_DEPTH.tif"),
+    ph              = file.path(root_dir, "2_HWSD2/HWSD2_D1/HWSD2_D1__PH_WATER.tif")
+  ),
+
+  rusle_c           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_CFactor_yr2012_v1.1_25km.tif"),
+  rusle_k           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_KFactor_v1.1_25km.tif"),
+  rusle_ls          = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_LSFactor_v1.1_25km.tif"),
+  rusle_r           = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_RFactor_v1.1_25km.tif"),
+
+  soilloss_2001     = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_SoilLoss_v1.1_yr2001_25km.tif"),
+  soilloss_2012     = file.path(root_dir, "2_GloSEM_25km/Data_25km/RUSLE_SoilLoss_v1.1_yr2012_25km.tif"),
+
+  reservoirs_dams   = file.path(root_dir, "2_Reservoirs and Dams/China_Dams.shp"),
+
+  gdp_dir           = file.path(root_dir, "2_GDP"),
+  pop_base_dir      = file.path(root_dir, "2_Population"),
+
+  precipitation_nc  = file.path(root_dir, "2_pco2Data/ERA5-Land-monthly_China_1950_2022.nc"),
+  temperature_nc    = file.path(root_dir, "2_pco2Data/ERA5-Land-monthly_China_1950_2022.nc"),
+
+  npp_dir           = file.path(root_dir, "2_pco2Data/npp"),
+  landcover_dir     = file.path(root_dir, "2_pco2Data/land_covernew")
+)
+
+# General Functions
+align_rasters <- function(target, reference) {
+  # 将栅格校正到与reference一致的投影、分辨率、范围
+  if (!ext(target) == ext(reference)) {
+    target <- project(target, crs(reference)) %>%
+      resample(reference, method = "near") %>%
+      crop(ext(reference))
+  }
+  return(target)
+}
+
+safe_read <- function(path, fun = rast) {
+  if (file.exists(path)) return(fun(path))
+  warning(paste("文件不存在:", path))
+  return(NULL)
+}
+```
+
+```{r Read and Prepare Data}
+# merge all watersheds####
+basins_dir <- file.path(root_dir, "POC_basic data/watershed")
+
+# read watershed
+basin_files <- list.files(basins_dir, pattern = "\\.shp$", full.names = TRUE)
+
+# 创建函数读取并转换坐标系
+read_and_transform <- function(file) {
+  basin_id <- tools::file_path_sans_ext(basename(file))
+  # 读取shp文件
+  shp <- st_read(file, quiet = TRUE)
+  # 转换到WGS84 (EPSG:4326)
+  shp <- st_transform(shp, crs = 4326)
+  # 添加WatershedID字段
+  shp %>% mutate(WatershedID = basin_id) %>% select(WatershedID, geometry)
+}
+
+# map function to align crs
+all_basins <- map_dfr(basin_files, read_and_transform)
+
+# Combine polygon with same WatershedID（if exist）
+main_basins <- all_basins %>%
+  mutate(geometry = st_make_valid(geometry)) %>%
+  group_by(WatershedID) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Read outlets Points ####
+# Read outlets and align crs
+outlets <- st_read(paths$outlets_shp) %>%
+  st_transform(4326) %>%  # 转换到WGS84
+  mutate(Gridcode = as.character(Gridcode))
+
+# Create mapping from Gridcode to WatershedID
+all_outlets <- outlets %>%
+  mutate(
+    WatershedID = case_when(
+      Gridcode %in% c("11") ~ "11",
+      Gridcode %in% c("12") ~ "12",
+      Gridcode %in% c("3","33","34","35","36","37") ~ "3",
+      Gridcode %in% c("4") ~ "4",      
+      Gridcode %in% c("51","52","53") ~ "50",
+      Gridcode %in% c("6") ~ "6",
+      Gridcode %in% c("71") ~ "71",
+      Gridcode %in% c("72") ~ "72",
+      Gridcode %in% c("73") ~ "73",
+      Gridcode %in% c("81","82","83","84","85","86","87","88","89") ~ "8",
+      Gridcode %in% c("91") ~ "91",
+      Gridcode %in% c("92") ~ "92",
+      Gridcode %in% c("93") ~ "93",
+      Gridcode %in% c("101","102","103") ~ "10"
+    )
+  )
+
+# Add longitude and latitude
+coords <- st_coordinates(all_outlets)
+all_outlets$Longitude <- coords[, "X"]
+all_outlets$Latitude <- coords[, "Y"]
+
+# filter effective points
+all_outlets <- all_outlets %>% 
+  filter(Longitude >= 0 & Latitude >= 0) %>%
+  filter(Gridcode != 0)
+
+
+# Prepare non spatial Basin_data ####
+basin_data <- main_basins %>%
+  st_drop_geometry() %>%
+  select(WatershedID)
+
+# Read time series and extract year/month
+time_periods <- read_excel(paths$times_data) %>% 
+  distinct(time) %>% 
+  mutate(
+    time  = as.Date(time),
+    Year  = as.numeric(format(time, "%Y")),
+    Month = as.numeric(format(time, "%m"))
+  )
+
+# Combine all basin IDs with all time points
+outlets_data <- expand_grid(basin_data, time_periods)
+
+# save processed data
+# st_write(main_basins, file.path(root_dir, "POC_basic data/watershed_merged/merged_watershed.shp"), delete_layer = TRUE)
+
+# st_write(all_outlets, file.path(root_dir, "POC_basic data/outlets_withBasin/outlets_withBasin.shp"), delete_layer = TRUE)
+```
+
+
+```{r _xxx_Read Outlet basin}
+# cat("\n==== Loading outlet basin and time series ====\n")
+# 
+# # Load DEM raster and define spatial reference
+# dem <- safe_read(paths$dem) %>% subst(-9999, NA)
+# 
+# # Read and reproject main basin shapefile to match DEM CRS
+# main_basins <- st_read(paths$main_basins_shp)
+# main_basins <- st_transform(main_basins, crs(dem))
+# 
+# # Dissolve sub-polygons by basin name (WatershedID), create unique row-based WatershedID
+# main_basins <- main_basins %>%
+#   group_by(W1102WB0_2) %>%
+#   summarise(geometry = st_union(geometry), .groups = "drop") %>%
+#   mutate(
+#     basin     = as.character(W1102WB0_2),
+#     WatershedID  = as.character(row_number())  # Use unique basin ID
+#   ) %>%
+#   drop_na()
+# 
+# # Extract non-spatial table for temporal combination
+# basin_data <- main_basins %>%
+#   st_drop_geometry() %>%
+#   select(basin, WatershedID)
+# 
+# # Read time series and extract year/month
+# time_periods <- read_excel(paths$times_data) %>% 
+#   distinct(time) %>% 
+#   mutate(
+#     time  = as.Date(time),
+#     Year  = as.numeric(format(time, "%Y")),
+#     Month = as.numeric(format(time, "%m"))
+#   )
+# 
+# # Combine all basin IDs with all time points
+# outlets_data <- expand_grid(basin_data, time_periods)
+
+```
+
+```{r _xxx_Read Outlet point}
+# # 1. Read shapefiles
+# outlets <- st_read(paths$outlets_shp)
+# 
+# # 2. Ensure consistent CRS
+# outlets <- st_transform(outlets, st_crs(dem))
+# 
+# # 3. Spatial join (points inside polygons)
+# outlets_with_basin <- st_join(outlets, main_basins[, "WatershedID"])
+# 
+# # 4. Split into matched and unmatched (outside) points
+# inside_points  <- outlets_with_basin %>% filter(!is.na(WatershedID))
+# outside_points <- outlets_with_basin %>% filter(is.na(WatershedID))
+# 
+# # 5. For unmatched points: assign to nearest basin (by distance to polygon boundary)
+# if (nrow(outside_points) > 0) {
+#   # Ensure basins are valid
+#   main_basins <- st_make_valid(main_basins)
+#   
+#   # Find nearest basin for each outside point
+#   nearest_basins_idx <- st_nearest_feature(outside_points, main_basins)
+#   outside_points$WatershedID <- main_basins$WatershedID[nearest_basins_idx]
+# }
+# 
+# # 6. Combine all matched points
+# all_outlets <- bind_rows(inside_points, outside_points)
+# 
+# # 7. Create basin-wise index: basinname_1, basinname_2, ...
+# all_outlets <- all_outlets %>%
+#   group_by(WatershedID) %>%
+#   mutate(station_index = row_number()) %>%
+#   ungroup() %>%
+#   mutate(id = paste0(WatershedID, "_", station_index)) %>%
+#   drop_na()
+# 
+# # Extract coordinates and attach to outlet points
+# coords <- st_coordinates(all_outlets)
+# all_outlets$Longitude <- coords[, 1]
+# all_outlets$Latitude  <- coords[, 2]
+# 
+# all_outlets <- all_outlets[all_outlets$Longitude >= 0 & all_outlets$Latitude >= 0, ]
+```
+
+```{r Constant: Slope}
+cat("\n==== Extracting Point‑level Slope from DEM ====\n")
+
+# Load DEM raster and define spatial reference
+dem <- safe_read(paths$dem) %>% subst(-9999, NA)
+res_ratio <- 500 / 90  
+dem <- aggregate(dem, fact = res_ratio, fun = "mean")
+
+# 1) slope raster
+slope <- terrain(dem, v = "slope", unit = "degrees")
+
+# 2) robust extraction function
+extract_slope <- function(pt, dem, slope_rast, max_steps = 10000) {
+  ## try direct extraction 
+  val_raw <- terra::extract(slope_rast, pt)
+  if ( is.null(val_raw) || nrow(val_raw) == 0 ) {
+    slope_val <- NA_real_
+  } else {
+    slope_val <- if (ncol(val_raw) == 1) val_raw[1, 1] else val_raw[1, 2]
+  }
+  if (!is.na(slope_val)) return(slope_val)
+
+  ## expand buffer search when NA
+  step <- terra::res(dem)[1]
+  
+  for (i in seq_len(max_steps)) {
+    buf   <- terra::buffer(pt, width = i * step)
+    crop  <- terra::crop(slope_rast, buf)
+    vals  <- terra::values(crop, na.rm = TRUE)
+    if (length(vals) > 0) return(vals[1])
+  }
+  NA_real_
+}
+
+# 3) convert all outlets to SpatVector once
+outlet_vect <- terra::vect(all_outlets)
+
+# 4) batch extract slopes
+unique_slopes <- all_outlets %>%
+  mutate(
+    Slope = purrr::map_dbl(seq_len(nrow(outlet_vect)), function(i) {
+      extract_slope(outlet_vect[i, ], dem, slope)
+    })
+  ) %>%
+  select(Gridcode, WatershedID, Slope)
+
+write.csv(unique_slopes, "E:/POC research/data/5_Prediction/slope.csv")
+```
+
+```{r Constant: upSlope}
+cat("\n==== Calculating upSlope ====\n")
+
+# Calculate slope
+slope <- terrain(dem, v = "slope", unit = "degrees")
+
+# Calculate mean slope in every basin
+calculate_upstream_slope <- function(basin_poly) {
+  slope_cropped <- crop(slope, basin_poly)
+  plot(slope_cropped)
+  slope_masked  <- mask(slope_cropped, basin_poly)
+  plot(slope_masked)
+  global(slope_masked, "mean", na.rm = TRUE)$mean
+}
+
+# Calculate elevation range in every basin
+calculate_elevation_range <- function(basin_poly) {
+  dem_cropped <- crop(dem, basin_poly)
+  dem_masked <- mask(dem_cropped, basin_poly)
+  max_elev <- global(dem_masked, "max", na.rm = TRUE)$max
+  min_elev <- global(dem_masked, "min", na.rm = TRUE)$min
+  max_elev - min_elev
+}
+
+# map the function
+unique_upslopes <- main_basins %>%
+  mutate(
+    upSlope = map_dbl(1:n(), ~ calculate_upstream_slope(main_basins[.x, ])),
+    Elev_range = map_dbl(1:n(), ~ calculate_elevation_range(main_basins[.x, ]))
+  ) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, upSlope, Elev_range)
+
+write.csv(unique_upslopes, "E:/POC research/data/5_Prediction/input_features/upslope.csv")
+```
+
+```{r Constant: WatershedArea}
+cat("\n==== Calculating Watershed Area (km²) ====\n")
+
+# Function to calculate the area of a basin polygon in square kilometers
+calculate_watershed_area <- function(basin_poly) {
+  # Ensure the projection is in meters (e.g., UTM) for area calculation
+  basin_projected <- st_transform(basin_poly, crs = 3857)  # Use EPSG:3857 (Web Mercator) or another equal-area CRS
+  area_km2 <- st_area(basin_projected) / 1e6  # Convert from m² to km²
+  return(as.numeric(area_km2))
+}
+
+# Apply to each polygon in main_basins
+unique_areas <- main_basins %>%
+  mutate(
+    Area = map_dbl(1:n(), ~ calculate_watershed_area(main_basins[.x, ]))
+  ) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, Area)
+
+# Optional: clean up memory
+rm(calculate_watershed_area)
+gc()
+
+```
+
+```{r Constant: Litter}
+cat("\n==== Calculating Static Mean Litter for Main Basins ====\n")
+
+litter_rast <- safe_read(paths$litter_file)  # 35-band raster
+
+litter_static <- mean(litter_rast, na.rm = TRUE)
+
+litter_static_results <- main_basins %>%
+  mutate(
+    Litter = map_dbl(1:n(), function(i) {
+      poly <- main_basins[i, ]
+      masked  <- mask(crop(litter_static, poly), poly)
+      global(masked, "mean", na.rm = TRUE)$mean
+    })
+  ) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, Litter)
+
+rm(litter_rast, litter_static)
+gc()
+
+```
+
+```{r Constant: SoilSource_HWSD2}
+cat("\n==== Calculating Soil Data (HWSD2) ====\n")
+
+# Align all soil rasters to reference raster
+soil_rasters <- map(paths$soil, safe_read)
+
+# Function to extract average soil values over a polygon
+calculate_soil_vars <- function(basin_poly) {
+  soil_vars <- imap_dfc(soil_rasters, ~{
+    r_crop   <- crop(.x, basin_poly)
+    r_masked <- mask(r_crop, basin_poly)
+    val      <- global(r_masked, "mean", na.rm = TRUE)$mean
+    set_names(list(val), .y)
+  })
+  return(soil_vars)
+}
+
+# Apply to each basin polygon
+unique_soils <- main_basins %>%
+  mutate(
+    soil_data = map(1:n(), ~ calculate_soil_vars(main_basins[.x, ]))
+  ) %>%
+  unnest(soil_data) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, clay, sand, silt, organic_carbon, root_depth, ph) %>%
+  rename(
+    Clay = clay,
+    Sand = sand,
+    Silt = silt,
+    Root_Depth = root_depth,
+    SOC = organic_carbon,
+    pH_soil = ph
+  )
+
+rm(soil_rasters, calculate_soil_vars)
+gc()
+```
+
+```{r Constant: SoilErosion_RUSLE}
+cat("\n==== Calculating RUSLE Factors (C/K/LS/R) ====\n")
+
+# Load and align rasters
+rusle_c_25km  <- rast(paths$rusle_c)
+rusle_k_25km  <- safe_read(paths$rusle_k)
+rusle_ls_25km <- safe_read(paths$rusle_ls)
+rusle_r_25km  <- safe_read(paths$rusle_r)
+
+# Function to extract average RUSLE values over a basin polygon
+calculate_rusle_factors <- function(basin_poly) {
+  c_masked  <- mask(crop(rusle_c_25km,  basin_poly), basin_poly)
+  k_masked  <- mask(crop(rusle_k_25km,  basin_poly), basin_poly)
+  ls_masked <- mask(crop(rusle_ls_25km, basin_poly), basin_poly)
+  r_masked  <- mask(crop(rusle_r_25km,  basin_poly), basin_poly)
+  
+  tibble(
+    C_factor  = global(c_masked,  "mean", na.rm = TRUE)$mean,
+    K_factor  = global(k_masked,  "mean", na.rm = TRUE)$mean,
+    LS_factor = global(ls_masked, "mean", na.rm = TRUE)$mean,
+    R_factor  = global(r_masked,  "mean", na.rm = TRUE)$mean
+  )
+}
+
+unique_rusle <- main_basins %>%
+  mutate(
+    rusle = map(1:n(), ~ calculate_rusle_factors(main_basins[.x, ]))
+  ) %>%
+  unnest(rusle) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, C_factor, K_factor, LS_factor, R_factor)
+
+rm(rusle_c_25km, rusle_k_25km, rusle_ls_25km, rusle_r_25km, calculate_rusle_factors)
+gc()
+```
+
+```{r Constant: Lithology}
+cat("\n==== Calculating Lithology Factors ====\n")
+
+# read files
+litho_tif_file <- "E:/POC research/data/2_Lithology/dztp_08022024_ras.tif"  
+litho_mapping_file <- "E:/POC research/data/2_Lithology/DIC_lithology_en.xlsx"
+litho_rast <- safe_read(litho_tif_file) 
+litho_map <- read_excel(litho_mapping_file)
+litho_types <- setNames(litho_map$Code, litho_map$Lithology)
+
+# function
+calculate_lithology <- function(basin_poly) {
+  # align raster
+  rast_proj <- project(litho_rast, crs(basin_poly))
+  rast_crop <- crop(rast_proj, basin_poly)
+  rast_mask <- mask(rast_crop, basin_poly)
+  
+  # percentage
+  res <- map_dbl(names(litho_types), function(name) {
+    code <- litho_types[[name]]
+    global(rast_mask == code, "mean", na.rm = TRUE)$mean
+  })
+  
+  tibble(!!!set_names(as.list(res), names(litho_types)))
+}
+
+# map function to extract lithology features
+unique_litho <- main_basins %>%
+  mutate(
+    litho = map(1:n(), ~ calculate_lithology(main_basins[.x, ]))
+  ) %>%
+  unnest(litho) %>%
+  st_drop_geometry() %>%
+  select(WatershedID, all_of(names(litho_types)))
+
+# results
+print(head(unique_litho))
+write.csv(unique_litho, "E:/POC research/data/5_Prediction/litho.csv")
+rm(litho_types, litho_map, litho_rast)
+```
+
+```{r Constant: Reservoirs_Dams}
+cat("\n==== Extracting Reservoir and Dam Features (Point-level & Basin-level) ====\n")
+
+# Load dam shapefile and preprocess - replace -99 with NA
+reservoirs_dams <- st_read(paths$reservoirs_dams)
+replace_neg99_with_na_sf <- function(sf_obj) {
+  attrs <- st_drop_geometry(sf_obj)
+  attrs[] <- lapply(attrs, function(x) {
+    if (is.numeric(x)) x[x == -99] <- NA
+    x
+  })
+  st_as_sf(cbind(attrs, st_geometry(sf_obj)))
+}
+reservoirs_dams <- replace_neg99_with_na_sf(reservoirs_dams)
+
+# Ensure CRS consistency with outlet points
+outlets <- st_transform(all_outlets, st_crs(reservoirs_dams))
+main_basins_proj <- st_transform(main_basins, st_crs(reservoirs_dams))
+
+# ----- Basin-level function: Summary statistics of dams within polygon -----
+calculate_summary_statistics <- function(dams_sub) {
+  dams_sub %>%
+    st_drop_geometry() %>%
+    summarize(
+      Num_Dams        = n(),
+      Avg_DamHeight_m = mean(DAM_HGT_M, na.rm = TRUE),  # 平均大坝高度
+      Max_DamHeight_m = max(DAM_HGT_M, na.rm = TRUE),   # 最大大坝高度
+      Avg_CatchmentArea_km2 = mean(CATCH_SKM, na.rm = TRUE),  # 平均集水面积
+      Sum_CatchmentArea_km2 = sum(CATCH_SKM, na.rm = TRUE),   # 总集水面积
+      Avg_Depth_m = mean(DEPTH_M, na.rm = TRUE),              # 平均深度
+      Sum_Depth_m = sum(DEPTH_M, na.rm = TRUE),               # 总深度
+      Avg_Capacity_Mm3 = mean(CAP_MCM, na.rm = TRUE),   # 平均水库容量
+      Sum_Capacity_Mm3 = sum(CAP_MCM, na.rm = TRUE),    # 总水库容量
+      Avg_Discharge_ls = mean(DIS_AVG_LS, na.rm = TRUE),      # 平均流量
+      Sum_Discharge_ls = sum(DIS_AVG_LS, na.rm = TRUE),       # 总流量
+      Avg_DOR_pc = mean(DOR_PC, na.rm = TRUE)                 # 调节度指数
+    )
+}
+
+# ----- Point-level function: Distance to nearest dam (skip NA attributes) -----
+calculate_nearest_dam_features <- function(point_geom, dams_sub) {
+  distances <- st_distance(point_geom, dams_sub)
+  dams_sub$distance_km <- as.numeric(distances) / 1000  # add distance column
+  
+  # Sort dams by distance
+  dams_ordered <- dams_sub[order(dams_sub$distance_km), ]
+  
+  # Find first dam with non-NA values in desired fields
+  for (i in seq_len(nrow(dams_ordered))) {
+    dam <- dams_ordered[i, ]
+    
+    # You can define more sophisticated rules if needed
+    if (!is.na(dam$DAM_HGT_M) && !is.na(dam$CAP_REP)) {
+      return(
+        tibble(
+          Nearest_Dam_Height_m        = dam$DAM_HGT_M,
+          Nearest_CatchmentArea_km2   = dam$CATCH_SKM,
+          Nearest_Depth_m             = dam$DEPTH_M,
+          Nearest_Capacity_Mm3        = dam$CAP_REP,
+          Nearest_Discharge_ls        = dam$DIS_AVG_LS,
+          Nearest_DOR_pc              = dam$DOR_PC,
+          Distance_to_Nearest_Dam_km  = dam$distance_km
+        )
+      )
+    }
+  }
+  
+  # If no suitable dam is found (all relevant fields are NA), return NA
+  return(tibble(
+    Nearest_Dam_Height_m        = NA_real_,
+    Nearest_CatchmentArea_km2   = NA_real_,
+    Nearest_Depth_m             = NA_real_,
+    Nearest_Capacity_Mm3        = NA_real_,
+    Nearest_Discharge_ls        = NA_real_,
+    Nearest_DOR_pc              = NA_real_,
+    Distance_to_Nearest_Dam_km  = NA_real_
+  ))
+}
+
+# ===== Basin-level summary: for each basin polygon =====
+basin_dam_summary <- purrr::map_dfr(1:nrow(main_basins_proj), function(i) {
+  basin_poly <- main_basins_proj[i, ]
+  WatershedID   <- basin_poly$WatershedID
+  
+  dams_in_basin <- reservoirs_dams[st_intersects(reservoirs_dams, basin_poly, sparse = FALSE), ]
+  
+  if (nrow(dams_in_basin) > 0) {
+    stats <- calculate_summary_statistics(dams_in_basin)
+  } else {
+    stats <- tibble(
+      Num_Dams         = 0,
+      Avg_DamHeight_m  = NA_real_
+    )
+  }
+  
+  bind_cols(tibble(WatershedID = WatershedID), stats)
+})
+
+# ===== Point-level summary: for each outlet =====
+point_dam_features <- purrr::map_dfr(1:nrow(outlets), function(i) {
+  outlet <- outlets[i, ]
+  outlet_id <- outlet$WatershedID
+  
+  # Find dams in corresponding basin polygon
+  basin_poly <- main_basins_proj[main_basins_proj$WatershedID == outlet_id, ]
+  dams_in_basin <- reservoirs_dams[st_intersects(reservoirs_dams, basin_poly, sparse = FALSE), ]
+  
+  if (nrow(dams_in_basin) > 0) {
+    nearest_stats <- calculate_nearest_dam_features(outlet, dams_in_basin)
+  } else {
+    nearest_stats <- tibble(
+      Nearest_Dam_Height_m     = NA_real_
+    )
+  }
+  
+  bind_cols(
+    tibble(Gridcode = outlet$Gridcode,
+           WatershedID = outlet_id, 
+           Longitude = st_coordinates(outlet)[1],
+           Latitude  = st_coordinates(outlet)[2]),
+    nearest_stats
+  )
+})
+
+# Clean up
+rm(reservoirs_dams, calculate_summary_statistics, calculate_nearest_dam_features)
+gc()
+
+```
+
+```{r Combine Point & Basin Data}
+cat("\n==== Aggregating all constant factors ====\n")
+
+# --- 1. prepare point-level variables ---
+point_vars <- list(
+  unique_slopes,
+  point_dam_features
+) %>%
+  reduce(left_join, by = c("Gridcode", "WatershedID"))
+
+# --- 2. Prepare basin-level dataframe ---
+basin_vars <- list(
+  unique_upslopes,
+  unique_areas,
+  unique_soils,
+  litter_static_results, 
+  unique_rusle,
+  unique_litho,
+  basin_dam_summary
+) %>%
+  reduce(left_join, by = "WatershedID")
+
+# --- 3. Merge point and basin variables ---
+Static_Factors <- point_vars %>%
+  left_join(basin_vars, by = "WatershedID")
+
+static_vars = st_drop_geometry(Static_Factors)
+
+static_vars <- static_vars %>%
+    mutate(across(
+    where(is.numeric),  # 仅对数值列操作
+    ~ replace(.x, is.na(.x) | is.infinite(.x), 0)  # 替换 NA 和 Inf/-Inf
+  ))
+
+write_xlsx(static_vars,
+  "E:/POC research/data/5_Prediction/Static_Variables.xlsx")
+
+```
+
+```{r}
+# 读取现有的 static_vars 数据
+static_vars <- readxl::read_xlsx("E:/POC research/data/5_Prediction/input_features/Static_Variables.xlsx")
+
+# 读取两个更新文件
+updated_pointslope <- read.csv("E:/POC research/data/5_Prediction/input_features/slope.csv")|>
+  mutate(WatershedID = as.character(WatershedID),
+         Gridcode = as.character(Gridcode))
+
+updated_upslope <- read.csv("E:/POC research/data/5_Prediction/input_features/upslope.csv")|>
+  mutate(WatershedID = as.character(WatershedID))
+updated_litho <- read.csv("E:/POC research/data/5_Prediction/input_features/litho.csv") |>
+  mutate(WatershedID = as.character(WatershedID))
+
+# 更新 litho 相关变量
+static_vars_updated <- static_vars %>%
+    select(-Slope) %>%
+  left_join(updated_pointslope, by = c("Gridcode", "WatershedID")) %>%  # 加入新数据
+  left_join(updated_upslope, by = "WatershedID") %>%
+  left_join(updated_litho, by = "WatershedID")  # 加入新数据
+
+# 再次处理 NA 和 Inf 值
+static_vars_updated <- static_vars_updated %>%
+  mutate(across(
+    where(is.numeric),
+    ~ replace(.x, is.na(.x) | is.infinite(.x), 0)
+  ))
+
+# 保存更新后的数据
+writexl::write_xlsx(static_vars_updated,
+  "E:/POC research/data/5_Prediction/input_features/Static_features.xlsx")
+
+```
+
+```{r Temporal: precipitation}
+
+cat("\n==== Preparing ERA5 Precipitation (mm/month) ====\n")
+
+# read ERA5 nc 
+ppt <- nc_open(paths$precipitation_nc)
+ppt_raw  <- ncvar_get(ppt,  "tp")          # (lon,lat,time)
+lon_ppt  <- ncvar_get(ppt,  "longitude")
+lat_ppt  <- ncvar_get(ppt,  "latitude")
+time_ppt <- ncvar_get(ppt,  "time")        # hours since 1900‑01‑01
+fill_ppt <- ncatt_get(ppt, "tp", "_FillValue")$value
+nc_close(ppt)
+
+# convert to mm/month
+ppt_raw[ppt_raw == fill_ppt] <- NA
+ppt_raw <- ppt_raw * 1000                 # m  ->  mm
+
+time_vec <- as.POSIXct(time_ppt * 3600, origin = "1900-01-01", tz = "GMT")
+
+# helper: number of days in each ERA5 month
+days_month <- function(x) {
+  y <- format(x, "%Y"); m <- as.integer(format(x, "%m"))
+  as.integer(format(as.Date(paste0(y,"-",m%%12+1,"-01"))-1, "%d"))
+}
+ppt_raw <- sweep(ppt_raw, 3, sapply(time_vec, days_month), `*`)  # mm/day → mm/month
+ppt_raw <- aperm(ppt_raw, c(2,1,3))                             # (lat,lon,time)
+
+# extraction function
+get_month_mean <- function(basin_poly, year_month, cube, lon, lat, tvec) {
+  idx <- which(format(tvec, "%Y-%m") == year_month)
+  if (length(idx)==0) return(NA_real_)
+
+  r <- rast(cube[,,idx],
+            extent = ext(range(lon), range(lat)),
+            crs    = "EPSG:4326")
+
+  masked <- mask(crop(r, basin_poly), basin_poly)
+  global(masked, "mean", na.rm = TRUE)$mean
+}
+
+# iterate over (WatershedID, time)
+precip_results <- outlets_data %>%
+  mutate(
+    Precipitation = purrr::pmap_dbl(
+      list(WatershedID, time),
+      \(bid, date)
+        get_month_mean(
+          basin_poly = main_basins[main_basins$WatershedID == bid, ],
+          year_month = format(date, "%Y-%m"),
+          cube = ppt_raw, lon = lon_ppt, lat = lat_ppt, tvec = time_vec)
+    )
+  ) |>
+  select(WatershedID, time, Precip)
+rm(ppt_raw)
+gc()
+
+```
+
+```{r Temporal: Temprature}
+
+cat("\n==== Preparing ERA5 Air Temperature (°C) ====\n")
+
+tmp <- nc_open(paths$temperature_nc)
+tmp_raw <- ncvar_get(tmp, "t2m")
+lon_tmp <- ncvar_get(tmp, "longitude")
+lat_tmp <- ncvar_get(tmp, "latitude")
+time_tmp<- ncvar_get(tmp, "time")
+fill_tmp<- ncatt_get(tmp,"t2m","_FillValue")$value
+nc_close(tmp)
+
+tmp_raw[tmp_raw == fill_tmp] <- NA
+tmp_raw <- tmp_raw - 273.15           # K → °C
+time_vec_t <- as.POSIXct(time_tmp*3600, origin="1900-01-01", tz="GMT")
+tmp_raw <- aperm(tmp_raw, c(2,1,3))
+
+get_month_tmp <- function(basin_poly, year_month, cube, lon, lat, tvec){
+  idx <- which(format(tvec, "%Y-%m")==year_month)
+  if (length(idx)==0) return(NA_real_)
+  r <- rast(cube[,,idx],
+            extent = ext(range(lon), range(lat)),
+            crs    = "EPSG:4326")
+  masked <- mask(crop(r, basin_poly), basin_poly)
+  global(masked,"mean", na.rm=TRUE)$mean
+}
+
+temp_results <- outlets_data %>%
+  mutate(
+    Temperature = purrr::pmap_dbl(
+      list(WatershedID, time),
+      \(bid, date)
+        get_month_tmp(
+          basin_poly = main_basins[main_basins$WatershedID == bid, ],
+          year_month = format(date, "%Y-%m"),
+          cube = tmp_raw, lon = lon_tmp, lat = lat_tmp, tvec = time_vec_t)
+    )
+  ) |>
+  select(WatershedID, time, Temp)
+rm(tmp_raw)
+gc()
+
+```
+
+```{r Temporal: NDVI}
+
+ndvi_yearly_dir <- "E:/POC research/data/2_MODIS_indices/NDVI_yearly"
+ndvi_files <- list.files(ndvi_yearly_dir, pattern = "NDVI_\\d{4}\\.tif$", full.names = TRUE)
+ndvi_years <- as.integer(gsub(".*NDVI_(\\d{4})\\.tif$", "\\1", ndvi_files))
+
+# build ndvi_stack
+ndvi_stack <- ndvi_files[order(ndvi_years)] |>
+  purrr::map(\(f) {
+    r <- terra::rast(f)
+    r_crs <- terra::crs(r, proj = TRUE)
+    basin_crs <- terra::crs(main_basins, proj = TRUE)
+    if (r_crs != basin_crs) {
+      r <- terra::project(r, basin_crs)
+    }
+    return(r)
+  })
+
+ndvi_years <- sort(ndvi_years)
+
+# extract function
+mean_ndvi <- function(poly, yr) {
+  idx <- match(yr, ndvi_years)
+  if (is.na(idx)) return(NA_real_)
+  
+  masked <- terra::mask(terra::crop(ndvi_stack[[idx]], poly), poly)
+  val <- terra::global(masked, "mean", na.rm = TRUE)$mean
+  
+  rm(masked)
+  gc()
+  
+  return(val)
+}
+
+# map function
+ndvi_results <- outlets_data |>
+  mutate(
+    NDVI = purrr::pmap_dbl(
+      list(WatershedID, Year),
+      \(bid, yr) mean_ndvi(main_basins[main_basins$WatershedID == bid, ], yr)
+    )) |>
+  select(WatershedID, time, NDVI)
+
+rm(ndvi_stack)
+gc()
+
+write_csv(ndvi_results, "E:/POC research/data/5_Prediction/input_features/NDVI.csv")
+```
+
+```{r Temporal: NPP}
+cat("\n==== Computing MODIS‑NPP (2001‑2022) ====\n")
+
+npp_files <- list.files(paths$npp_dir, "*_new.tif$", full.names = TRUE)
+npp_years <- 2001:(2001 + length(npp_files) - 1)
+
+npp_stack <- purrr::map(npp_files, terra::rast) |>
+             purrr::map(~ project(.x, "EPSG:4326"))
+
+mean_npp <- function(poly, yr) {
+  idx <- match(yr, npp_years)
+  if (is.na(idx)) return(NA_real_)
+  
+  masked <- terra::mask(terra::crop(npp_stack[[idx]], poly), poly)
+  
+  val <- terra::global(masked, "mean", na.rm = TRUE)$mean
+  
+  rm(masked)
+  gc()
+  
+  return(val)
+}
+
+npp_results <- outlets_data |>
+  mutate(
+    NPP = purrr::pmap_dbl(
+      list(WatershedID, Year),
+      \(bid, yr) mean_npp(main_basins[main_basins$WatershedID == bid, ], yr)
+    )
+  ) |>
+  select(WatershedID, time, NDVI)
+rm(npp_stack)
+gc()
+
+write_csv(npp_results, "E:/POC research/data/5_Prediction/input_features/NPP.csv")
+```
+
+```{r Temporal: LandCover}
+cat("\n==== Computing land‑cover fractions ====\n")
+
+## 1.  Read / align every annual land‑cover TIF into a list     
+lc_files <- list.files(paths$landcover_dir, "_1.tif$", full.names = TRUE)
+
+# replicate 1985 file 4× to 1985-1989
+f1985 <- grep("1985_1.tif$", lc_files, value = TRUE)
+if (length(f1985) == 1)
+  lc_files <- c(rep(f1985, 5), setdiff(lc_files, f1985))
+
+years_lc <- 1985:(1985 + length(lc_files) - 1)
+
+message(sprintf("Land‑cover years: %d–%d", min(years_lc), max(years_lc)))
+
+lc_stack <- purrr::map(lc_files, \(f) {
+  terra::rast(f) |>
+    terra::project("EPSG:4326")           # match basin CRS
+})
+
+class_codes <- c(
+  Cropland  = 1, Forest = 2, Shrub = 3, Grassland = 4,
+  Water     = 5, Snow_Ice = 6, Barren   = 7, Urban = 8, Wetland = 9
+)
+
+## 2.  Helper: fraction of class code (1–9) in a polygon & year     
+lc_fraction <- function(poly, year) {
+  idx <- match(year, years_lc)
+  if (is.na(idx)) return(setNames(rep(NA_real_, length(class_codes)), names(class_codes)))
+  
+  r <- terra::crop(lc_stack[[idx]], poly) |> terra::mask(poly)
+
+  stats <- sapply(class_codes, function(code) {
+    terra::global(r == code, "mean", na.rm = TRUE)$mean
+  })
+  names(stats) <- names(class_codes)
+  rm(r)
+  gc()
+  return(stats)
+}
+
+## 3.  Loop across (WatershedID, year) to build result table    
+landcover_results <- outlets_data |>
+  mutate(
+    lc_props = purrr::map2(
+      WatershedID, Year,
+      \(bid, yr) {
+        poly <- main_basins[main_basins$WatershedID == bid, ]
+        lc_fraction(poly, yr)
+      }
+    )
+  ) |>
+  tidyr::unnest_wider(lc_props) |>
+  select(WatershedID, time, 
+         Cropland, Forest, Shrub, Grassland, Water, Snow_Ice, Barren, Urban, Wetland)
+
+rm(lc_stack)
+gc()
+
+```
+
+```{r Temporal: Soil-loss}
+cat("\n==== Computing basin soil‑loss ====\n")
+
+sl_2001 <- rast(paths$soilloss_2001)
+sl_2012 <- rast(paths$soilloss_2012)
+
+soil_loss <- function(poly, yr) {
+  r <- if (yr < 2012) sl_2001 else sl_2012
+  masked <- terra::mask(terra::crop(r, poly), poly)
+  val = terra::global(masked, "mean", na.rm = TRUE)$mean
+  
+  rm(masked)
+  gc()
+  
+  return(val)
+}
+
+soilloss_results <- outlets_data |>
+  mutate(
+    SoilLoss = purrr::pmap_dbl(
+      list(WatershedID, Year),
+      \(bid, yr) soil_loss(main_basins[main_basins$WatershedID == bid, ], yr)
+    )
+  ) |>
+  select(WatershedID, time, SoilLoss)
+
+rm(sl_2001, sl_2012)
+gc()
+
+```
+
+```{r Temporal: GDP}
+cat("\n==== Computing basin GDP (1990‑2015) ====\n")
+
+tif_files <- list.files(paths$gdp_dir, "\\.tif$", full.names = TRUE)
+years_gdp <- 1990:2015
+
+gdp_stack <- purrr::map(tif_files, terra::rast) |>
+  purrr::map(~ project(.x, "EPSG:4326"))
+
+# helper ─ polygon mean/sum
+get_gdp <- function(basin_poly, yr) {
+  idx <- match(yr, years_gdp)
+  if (is.na(idx)) return(NA_real_)
+  masked <- terra::mask(terra::crop(gdp_stack[[idx]], basin_poly), basin_poly)
+  terra::global(masked, "sum", na.rm = TRUE)$sum  
+}
+
+gdp_results <- outlets_data |>
+  mutate(
+    GDP = purrr::pmap_dbl(
+      list(WatershedID, Year),
+      \(bid, yr) get_gdp(main_basins[main_basins$WatershedID == bid, ], yr)
+    )
+  ) |>
+  select(WatershedID, time, GDP)
+  
+rm(gdp_stack)
+gc()
+
+```
+
+```{r Temporal: Population}
+cat("\n==== Computing basin‑level population density ====\n")
+
+## 1.  read & prepare each ADF (popYYYY/tpopYYYY/w001001.adf)  
+target_years <- 1990:2020
+adf_dirs <- file.path(paths$pop_base_dir,
+                      paste0("pop", target_years, "/tpop", target_years))
+valid_idx  <- file.exists(file.path(adf_dirs, "w001001.adf"))
+adf_dirs   <- adf_dirs[valid_idx]
+pop_years  <- target_years[valid_idx]
+
+stopifnot(length(adf_dirs) > 0)
+
+read_pop <- function(adf_dir) {
+  y  <- gsub(".*pop(\\d{4}).*", "\\1", adf_dir) |> as.integer()
+  r0 <- terra::rast(file.path(adf_dir, "w001001.adf"))
+  
+  nodata_val <- -2147483648 
+  r0[r0 == nodata_val] <- NA
+  
+  pop_crs <- terra::crs(r0, proj = TRUE)
+  basin_crs <- terra::crs(main_basins, proj = TRUE)
+
+  if (pop_crs != basin_crs) {
+    r0 <- terra::project(r0, basin_crs, method = "near")
+  }
+
+  names(r0) <- y
+  return(r0)
+}
+
+pop_stack <- purrr::map(adf_dirs, read_pop)
+names(pop_stack) <- pop_years      # easy look‑up later
+
+## 2.  helper: mean population density for a basin polygon + year
+pop_density_mean <- function(poly, year) {
+  r <- pop_stack[[as.character(year)]]
+  if (is.null(r)) return(NA_real_)
+  
+  # area of each cell (km²) in lat/long grid
+  cell_area <- terra::cellSize(r, unit = "km")
+  
+  masked_pop  <- terra::mask(terra::crop(r,   poly), poly)
+  masked_area <- terra::mask(terra::crop(cell_area, poly), poly)
+  
+  pop_sum  <- terra::global(masked_pop,  "sum",  na.rm = TRUE)$sum
+  area_sum <- terra::global(masked_area, "sum",  na.rm = TRUE)$sum 
+  val <- pop_sum / area_sum
+  
+  rm(masked_pop, cell_area, masked_area)
+  gc()
+  
+  return(val)
+}
+
+## 3.  vectorised over outlets_data (WatershedID, year)   
+pop_results <- outlets_data |>
+  mutate(
+    Pop_density = purrr::pmap_dbl(
+      list(WatershedID, Year),
+      \(bid, yr) {
+        poly <- main_basins[main_basins$WatershedID == bid, ]
+        pop_density_mean(poly, yr)
+      }
+    )
+  ) |>
+  select(WatershedID, time, Pop_density)
+
+rm(pop_stack)
+gc()
+
+```
+
+```{r Temporal: Reservoirs_Dams}
+cat("\n==== Computing time‑window dam counts ====\n")
+
+reservoirs_dams <- st_read(paths$reservoirs_dams) |> st_make_valid()
+
+dam_counts <- function(poly, yr) {
+  dams <- reservoirs_dams[st_intersects(reservoirs_dams, poly, sparse = FALSE), ]
+  tibble(
+    Num_Dams_10yr = sum(dams$YEAR >= yr - 10, na.rm = TRUE),
+    Num_Dams_20yr = sum(dams$YEAR >= yr - 20, na.rm = TRUE),
+    Num_Dams_30yr = sum(dams$YEAR >= yr - 30, na.rm = TRUE),
+    Num_Dams_40yr = sum(dams$YEAR >= yr - 40, na.rm = TRUE),
+    Num_Dams_50yr = sum(dams$YEAR >= yr - 50, na.rm = TRUE)
+  )
+}
+
+resdam_temporal_results <- outlets_data |>
+  mutate(
+    dam_stats = purrr::pmap(
+      list(WatershedID, Year),
+      \(bid, yr) dam_counts(main_basins[main_basins$WatershedID == bid, ], yr)
+    )
+  ) |>
+  unnest(dam_stats) |>
+  select(WatershedID, time, 
+         Num_Dams_10yr, Num_Dams_20yr, Num_Dams_30yr, Num_Dams_40yr, Num_Dams_50yr)
+
+```
+
+```{r Combine all variables}
+# combine temporal variables ####
+temporal_vars <- list(
+  ndvi_results, 
+  precip_results,
+  temp_results,
+  npp_results,
+  landcover_results,
+  soilloss_results,
+  gdp_results,
+  pop_results,
+  resdam_temporal_results
+) %>%
+  reduce(left_join, by = c("WatershedID","time"))
+
+# combine all data
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(writexl)
+
+static_vars <- read_excel("E:\\POC research\\data\\5_Prediction\\Static_Variables.xlsx")
+
+# converse basin temporal vars to point temporal vars ####
+# (WatershedID, time)
+basin_time <- temporal_vars %>% 
+  distinct(WatershedID, time)
+
+# (Gridcode, WatershedID)
+point_basin <- static_vars %>% 
+  distinct(Gridcode, WatershedID)
+
+# inner_join by WatershedID
+point_time_grid <- point_basin %>% 
+  inner_join(basin_time, by = "WatershedID")   # nrow = n(point) × n(time per basin)
+
+# combine static and temporal vars ####
+point_timeseries <- point_time_grid %>% 
+  # static（Gridcode, WatershedID）
+  left_join(static_vars,   by = c("Gridcode", "WatershedID")) %>% 
+  # temporal（WatershedID, time）
+  left_join(temporal_vars, by = c("WatershedID", "time")) %>% 
+  relocate(Gridcode, WatershedID, time, Year, Month, Longitude, Latitude)              
+
+# export
+write_xlsx(
+  point_timeseries,
+  "E:/POC research/data/5_Prediction/Input_Variables.xlsx"
+)
+```
+
+```{r}
+library(dplyr)
+library(readxl)
+library(writexl)
+library(lubridate)
+library(readr)
+
+# 读入数据 ####
+
+old_input  <- read_excel("E:/POC research/data/5_Prediction/input_features/Input_Variables.xlsx")
+static_vars <- read_excel("E:/POC research/data/5_Prediction/input_features/Static_features.xlsx") |>
+  select(-Longitude, -Latitude)
+ 
+npp   <- read_csv("E:/POC research/data/5_Prediction/input_features/NPP.csv") |>
+  mutate(WatershedID = as.character(WatershedID))
+ndvi  <- read_csv("E:/POC research/data/5_Prediction/input_features/NDVI.csv") |>
+  mutate(WatershedID = as.character(WatershedID))
+
+# 确保日期列格式一致（如果 time 是字符串或日期）
+if (!inherits(old_input$time, "Date")) {
+  old_input$time <- as.Date(old_input$time)
+}
+if (!inherits(npp$time, "Date")) {
+  npp$time <- as.Date(npp$time)
+  ndvi$time <- as.Date(ndvi$time)
+}
+
+duplicate_cols <- intersect(names(static_vars), names(old_input))
+static_vars <- static_vars %>%
+  select(-setdiff(duplicate_cols, c("Gridcode", "WatershedID")))
+
+# 从 static_vars 获取 Gridcode - WatershedID 对应关系
+grid_watershed <- static_vars %>%
+  distinct(Gridcode, WatershedID)
+
+# 将 NPP 扩展为 Gridcode + time
+npp_expanded <- grid_watershed %>%
+  inner_join(npp, by = "WatershedID")
+
+# 将 NDVI 扩展为 Gridcode + time
+ndvi_expanded <- grid_watershed %>%
+  inner_join(ndvi, by = "WatershedID")
+
+# 4. 合并所有变量到旧输入数据 ####
+updated_input <- old_input %>%
+  left_join(npp_expanded,  by = c("Gridcode", "WatershedID", "time")) %>%
+  left_join(ndvi_expanded, by = c("Gridcode", "WatershedID", "time")) %>%
+  left_join(static_vars, by = c("Gridcode", "WatershedID"))
+
+# 5. 排列列顺序
+updated_input <- updated_input %>%
+  relocate(Gridcode, WatershedID, time, Longitude, Latitude) %>%
+  select(-time)
+
+# 6. 导出结果 ####
+write_xlsx(
+  updated_input,
+  "E:/POC research/data/5_Prediction/input_features/Input_Features.xlsx"
+)
+
+```
+
+```{r Add Water Discharge}
+point_timeseries <- point_timeseries %>%
+  mutate(
+    BasinID = case_when(
+      Gridcode %in% c("11","12") ~ "1",
+      Gridcode %in% c("3","33","34","35","36","37") ~ "3",
+      Gridcode %in% c("4") ~ "4",     
+      Gridcode %in% c("51","52","53") ~ "50",
+      Gridcode %in% c("6") ~ "6",
+      Gridcode %in% c("71","72","73") ~ "7",
+      Gridcode %in% c("81","82","83","84","85","86","87","88","89") ~ "8",
+      Gridcode %in% c("91","92","93") ~ "9",
+      Gridcode %in% c("101","102","103") ~ "10"
+    )
+  ) 
+
+discharge <- read_excel("E:\\POC research\\data\\POC_basic data\\POC_watershed\\discharge_majorbaisn_Grades_2001-2020_monthly.xlsx")
+
+point_timeseries <- point_timeseries %>%
+  mutate(across(BasinID, ~ suppressWarnings(as.numeric(.)))) %>%
+  left_join(discharge, by = c("BasinID", "Year", "Month"))
+
+write_xlsx(
+  point_timeseries,
+  "E:/POC research/data/5_Prediction/Input.xlsx"
+)
+#####
+# # 加载必要的库
+# library(ncdf4)
+# library(dplyr)
+# library(lubridate)
+# library(readxl)
+# library(writexl)
+# library(sf)
+# 
+# # 读取 GRFR nc 文件
+# nc_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\GRFR\\output_pfaf_04_1979-2019.nc"
+# nc_data <- nc_open(nc_file)
+# 
+# # 获取所有时间点
+# time <- ncvar_get(nc_data, "time")
+# origin <- as.Date("1979-01-01")  # 时间从 1979-01-01 开始
+# time_dates <- origin + days(time)
+# 
+# # 读取站点表格
+# stations <- read_excel("E:/POC research/data/5_Prediction/Point_Input_Variables.xlsx")
+# 
+# # 确保站点表格中有日期列
+# stations$Date <- as.Date(stations$time)
+# 
+# # 读取 shapefile 文件，获取河流段及其 rivid
+# shp_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\MERIT_Basins_v0.7\\level_01_v0.7\\pfaf_03_riv_3sMERIT.shp"
+# river_shp <- st_read(shp_file)
+# 
+# # 将站点表格转换为空间点对象
+# stations_sf <- st_as_sf(stations, coords = c("Longitude", "Latitude"), crs = st_crs(river_shp))
+# 
+# # 进行空间匹配，找到每个站点最近的河流段（nearest feature）
+# stations$station_rivid <- st_nearest_feature(stations_sf, river_shp)
+# 
+# # 创建一个函数来找到最近的时间索引
+# find_nearest_time_index <- function(date, time_dates) {
+#   return(which.min(abs(time_dates - date)))
+# }
+# 
+# # 初始化一个新的列来存储填补的流量数据
+# stations$`Water discharge2 (m3/s)` <- NA
+# 
+# # 循环每一条记录
+# for (i in 1:nrow(stations)) {
+#   # 获取当前记录的日期和 rivid
+#   current_date <- stations$Date[i]
+#   current_rivid <- stations$station_rivid[i]
+# 
+#   # 找到最近的时间索引
+#   time_index <- find_nearest_time_index(current_date, time_dates)
+# 
+#   # 读取当前站点对应时间点的流量数据
+#   discharge_value <- ncvar_get(nc_data, "Qout", start = c(current_rivid, time_index), count = c(1, 1))
+# 
+#   # 将读取到的流量值补充到相应位置
+#   stations$`Water discharge2 (m3/s)`[i] <- discharge_value
+# 
+# 
+# }
+# 
+# # 关闭 nc 文件
+# nc_close(nc_data)
+
+```

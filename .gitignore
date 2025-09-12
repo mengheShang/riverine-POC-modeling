@@ -1,0 +1,13 @@
+# RStudio temporary files
+.Rproj.user/
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+
+# MacOS system files
+.DS_Store
+
+# Windows system files
+Thumbs.db
+"" 

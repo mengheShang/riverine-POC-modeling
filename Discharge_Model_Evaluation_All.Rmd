@@ -1,0 +1,340 @@
+---
+title: "统计模型可用性_GRADES"
+output: html_document
+date: "2025-08-08"
+---
+
+```{r }
+# 加载必要的库
+library(ncdf4)
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(writexl)
+library(sf)
+library(ggplot2)
+
+# 读取站点表格
+stations <- read_excel("E:\\POC research\\data\\3_POC records\\original_records_correct.xlsx")
+
+# 确保站点表格中有经纬度和日期列，并添加 Year 和 Month 列
+stations <- stations %>%
+  mutate(Date = as.Date(Sampling_Time),
+         Year = year(Date),
+         Month = month(Date))
+
+# 读取流域 shp 文件，获取河段及其 rivid
+shp_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\MERIT_Basins_v0.7\\level_01_v0.7\\pfaf_04_riv_3sMERIT.shp"
+river_shp <- st_read(shp_file)
+
+# 将站点表格转换为空间点对象
+stations_sf <- st_as_sf(stations, coords = c("Longitude", "Latitude"), crs = st_crs(river_shp))
+
+# 进行空间匹配，找到每个站点最近的河流段（nearest feature）
+nearest_indices <- st_nearest_feature(stations_sf, river_shp)
+stations$rivid <- river_shp$COMID[nearest_indices]
+
+```
+
+```{r}
+library(ncdf4)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(readxl)
+library(writexl)
+library(sf)
+
+compare_station_timeseries_3models <- function(station_id,
+                                               station_table,
+                                               nc_file_model1, var_model1, model1_name,
+                                               nc_file_model2, var_model2, model2_name,
+                                               nc_file_model3, var_model3, model3_name,
+                                               nc_time_origin_model1,
+                                               nc_time_origin_model3,
+                                               obs_date_col, obs_value_col,
+                                               start_date, end_date) {
+  
+  start_date <- as.Date(start_date)
+  end_date   <- as.Date(end_date)
+  
+  # 找到站点记录
+  station_info <- station_table %>% filter(ID == station_id)
+  if (nrow(station_info) == 0) stop("station ID not found")
+  print(station_info)
+  
+  current_rivid <- station_info$rivid[1]
+  
+  ## ---- 模型1 ----
+  nc1 <- nc_open(nc_file_model1)
+  time1 <- ncvar_get(nc1, "time")
+  time_dates1 <- as.Date(nc_time_origin_model1) + days(time1)
+  rivids1 <- ncvar_get(nc1, "rivid")
+  riv_index1 <- which(rivids1 == current_rivid)
+  model1_series <- ncvar_get(nc1, var_model1, start = c(riv_index1, 1), count = c(1, -1))
+  nc_close(nc1)
+  df_model1 <- data.frame(Date = time_dates1, Value = model1_series, Source = model1_name)
+  
+  ## ---- 模型2 ----
+  nc2 <- nc_open(nc_file_model2)
+  time2 <- ncvar_get(nc2, "time")
+  time_dates2 <- as.Date(nc_time_origin_model1) + days(time2)  # 和模型1时间原点一样
+  rivids2 <- ncvar_get(nc2, "rivid")
+  riv_index2 <- which(rivids2 == current_rivid)
+  model2_series <- ncvar_get(nc2, var_model2, start = c(riv_index2, 1), count = c(1, -1))
+  nc_close(nc2)
+  df_model2 <- data.frame(Date = time_dates2, Value = model2_series, Source = model2_name)
+  
+  ## ---- 模型3 (WaterGAP) ----
+  nc3 <- nc_open(nc_file_model3)
+  lon <- ncvar_get(nc3, "lon")
+  lat <- ncvar_get(nc3, "lat")
+  time3 <- ncvar_get(nc3, "time")
+  time_dates3 <- as.Date(nc_time_origin_model3) %m+% months(time3)
+  dis <- ncvar_get(nc3, var_model3)  # [lon, lat, time]
+  nc_close(nc3)
+  
+  # 找到最近网格点
+  find_nearest_index <- function(value, vector) which.min(abs(vector - value))
+  lon_idx <- find_nearest_index(station_info$Longitude[1], lon)
+  lat_idx <- find_nearest_index(station_info$Latitude[1], lat)
+  
+  model3_series <- dis[lon_idx, lat_idx, ]
+  df_model3 <- data.frame(Date = time_dates3, Value = model3_series, Source = model3_name)
+  
+  ## ---- 实测数据 ----
+  df_obs <- station_info %>%
+    select(all_of(obs_date_col), all_of(obs_value_col)) %>%
+    rename(Date = !!obs_date_col, Value = !!obs_value_col) %>%
+    mutate(Date = as.Date(Date), Source = "Observed")
+  
+  ## ---- 合并数据 ----
+  combined_df <- bind_rows(df_model1, df_model2, df_model3, df_obs) %>%
+    filter(Date >= start_date & Date <= end_date)
+  
+  ## ---- 绘图 ----
+  ggplot(combined_df, aes(x = Date, y = Value, color = Source)) +
+    geom_line(data = subset(combined_df, Source != "Observed"), linewidth = 1) +
+    geom_point(data = subset(combined_df, Source == "Observed"), size = 2) +
+    theme_minimal() +
+    labs(title = paste("Station", station_id, "Time Series Comparison"),
+         subtitle = paste(start_date, "to", end_date),
+         x = "Date", y = "Discharge (m³/s)")
+}
+
+# 调用示例
+compare_station_timeseries_3models(
+  station_id = "83",
+  station_table = stations,
+  nc_file_model1 = "E:/POC research/data/2_Discharge and Sediment/GRFR/output_pfaf_04_1979-2019.nc",
+  var_model1 = "Qout", model1_name = "GRFR",
+  nc_file_model2 = "E:/POC research/data/2_Discharge and Sediment/GRADES/GRADES_hydroDL_V2.0_pfaf_04_19800101_20230930.nc",
+  var_model2 = "Qout", model2_name = "GRADES",
+  nc_file_model3 = "E:/POC research/data/2_Discharge and Sediment/WaterGAP/watergap_22d_gswp3-w5e5_histsoc_dis_monthly_1901_2019.nc4",
+  var_model3 = "dis", model3_name = "WaterGAP",
+  nc_time_origin_model1 = "1979-01-01",
+  nc_time_origin_model3 = "1901-01-01",
+  obs_date_col = "Sampling_Time",
+  obs_value_col = "Water discharge2 (m3/s)",
+  start_date = "2005-01-01",
+  end_date = "2005-12-31"
+)
+
+```
+
+```{r}
+
+# 读取 nc 文件
+nc_file <- "E:\\POC research\\data\\2_Discharge and Sediment\\GRADES\\GRADES_hydroDL_V2.0_pfaf_04_19800101_20230930.nc"
+nc_data <- nc_open(nc_file)
+
+# 获取时间维度信息
+time <- ncvar_get(nc_data, "time")
+origin <- as.Date("1979-01-01")  # 时间起点
+time_dates <- origin + days(time)
+
+# 获取NetCDF中所有的rivid列表
+nc_rivids <- ncvar_get(nc_data, "rivid")  
+
+# 创建一个函数来找到最近的时间索引
+find_nearest_time_index <- function(date, time_dates) {
+  which.min(abs(time_dates - date))
+}
+
+# 初始化 Model_Discharge 列
+stations$Model_Discharge <- NA
+
+# 为每条记录单独读取流量数据
+for (i in 1:nrow(stations)) {
+  # 获取当前记录的日期和 rivid
+  current_date <- stations$Date[i]
+  current_rivid <- stations$rivid[i]
+  river_index <- which(nc_rivids == current_rivid)
+  
+  # 找到最近的时间索引
+  time_index <- find_nearest_time_index(current_date, time_dates)
+  
+  # 只读取当前 rivid 和时间索引的 Qout 值
+  model_discharge <- ncvar_get(nc_data, "Qout", 
+                               start = c(river_index, time_index),
+                               count = c(1, 1))
+  
+  # 将读取到的模型流量数据存入对应位置
+  stations$Model_Discharge[i] <- model_discharge
+}
+
+# 关闭 nc 文件
+nc_close(nc_data)
+
+# 检查数据匹配情况
+head(stations)
+
+# 计算拟合优度等统计数据
+comparison_data <- stations %>%
+  filter(!is.na(`Water discharge2 (m3/s)`) & !is.na(Model_Discharge))
+
+# 计算拟合优度的函数
+calculate_statistics <- function(observed, predicted) {
+  # 计算 R²
+  r_squared <- cor(observed, predicted)^2
+  # 计算 RMSE
+  rmse <- sqrt(mean((observed - predicted)^2))
+  # 计算 MAE
+  mae <- mean(abs(observed - predicted))
+  
+  return(list(R2 = r_squared, RMSE = rmse, MAE = mae))
+}
+
+# 对实测数据与模型数据进行拟合优度计算
+stats <- calculate_statistics(comparison_data$`Water discharge2 (m3/s)`, comparison_data$Model_Discharge)
+
+# 输出统计结果
+print(paste("R²: ", stats$R2))
+print(paste("RMSE: ", stats$RMSE))
+print(paste("MAE: ", stats$MAE))
+
+# 添加季节信息
+comparison_data <- comparison_data %>%
+  mutate(Season = case_when(
+    Month %in% c(12, 1, 2) ~ "Winter",  # 冬季
+    Month %in% c(3, 4, 5) ~ "Spring",   # 春季
+    Month %in% c(6, 7, 8) ~ "Summer",   # 夏季
+    Month %in% c(9, 10, 11) ~ "Autumn"  # 秋季
+  ))
+
+# 绘制散点图，实测值在 x 轴，模型值在 y 轴，使用颜色区分季节
+ggplot(comparison_data, aes(x = `Water discharge2 (m3/s)`, y = Model_Discharge, color = Season)) +
+  geom_point(size = 3, alpha = 0.6) +  # 绘制散点
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +  # 1:1 标准线
+  theme_minimal() +
+  labs(
+    title = "Water Discharge of GRFR Model",
+    x = "Observed Water Discharge (m3/s)",
+    y = "Modelled Water Discharge (m3/s)"
+  ) +
+  scale_color_brewer(palette = "Set2") +  # 使用颜色区分季节
+  # 添加拟合优度信息
+  annotate("text", x = max(comparison_data$`Water discharge2 (m3/s)`) * 0.7, 
+           y = max(comparison_data$Model_Discharge) * 0.5,
+           label = paste("R² = ", round(stats$R2, 3), "\nRMSE = ", round(stats$RMSE, 2), "\nMAE = ", round(stats$MAE, 2)),
+           color = "black") +
+  coord_fixed(ratio = 1)
+
+```
+
+```{r}
+# interactive plot
+library(plotly)
+
+comparison_data <- comparison_data %>%
+  mutate(
+    ID_label = paste0("Station ID: ", ID,
+                      "<br>Obs: ", round(`Water discharge2 (m3/s)`, 2),
+                      "<br>Mod: ", round(Model_Discharge, 2))
+  )
+
+p <- ggplot(comparison_data, aes(
+  x = `Water discharge2 (m3/s)`,
+  y = Model_Discharge,
+  color = Season,
+  text = ID_label  # 提供交互提示
+)) +
+  geom_point(size = 3, alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    title = "Water Discharge of GRADES Model (Interactive)",
+    x = "Observed Water Discharge (m3/s)",
+    y = "Modelled Water Discharge (m3/s)"
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  coord_fixed(ratio = 1)
+
+ggplotly(p, tooltip = "text")
+
+```
+
+```{r}
+low_obs <- quantile(comparison_data$`Water discharge2 (m3/s)`, 0.1)
+low_mod <- quantile(comparison_data$Model_Discharge, 0.1)
+
+low_obs_points <- comparison_data %>% 
+  filter(`Water discharge2 (m3/s)` < low_obs)
+low_model_points <- comparison_data %>%
+  filter(Model_Discharge < low_mod)
+
+filtered_data <- comparison_data %>% 
+  filter(`Water discharge2 (m3/s)` >= low_obs & 
+           Model_Discharge >= low_mod)
+
+# 计算拟合优度等统计数据
+comparison_data <- filtered_data %>%
+  filter(!is.na(`Water discharge2 (m3/s)`) & !is.na(Model_Discharge))
+
+# # 计算拟合优度的函数
+# calculate_statistics <- function(observed, predicted) {
+#   # 计算 R²
+#   r_squared <- cor(observed, predicted)^2
+#   # 计算 RMSE
+#   rmse <- sqrt(mean((observed - predicted)^2))
+#   # 计算 MAE
+#   mae <- mean(abs(observed - predicted))
+#   
+#   return(list(R2 = r_squared, RMSE = rmse, MAE = mae))
+# }
+
+# 对实测数据与模型数据进行拟合优度计算
+stats <- calculate_statistics(comparison_data$`Water discharge2 (m3/s)`, comparison_data$Model_Discharge)
+
+# 输出统计结果
+print(paste("R²: ", stats$R2))
+print(paste("RMSE: ", stats$RMSE))
+print(paste("MAE: ", stats$MAE))
+
+# 添加季节信息
+comparison_data <- comparison_data %>%
+  mutate(Season = case_when(
+    Month %in% c(12, 1, 2) ~ "Winter",  # 冬季
+    Month %in% c(3, 4, 5) ~ "Spring",   # 春季
+    Month %in% c(6, 7, 8) ~ "Summer",   # 夏季
+    Month %in% c(9, 10, 11) ~ "Autumn"  # 秋季
+  ))
+
+# 绘制散点图，实测值在 x 轴，模型值在 y 轴，使用颜色区分季节
+ggplot(comparison_data, aes(x = `Water discharge2 (m3/s)`, y = Model_Discharge, color = Season)) +
+  geom_point(size = 3, alpha = 0.6) +  # 绘制散点
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +  # 1:1 标准线
+  theme_minimal() +
+  labs(
+    title = "Water Discharge of GRADES Model",
+    x = "Observed Water Discharge (m3/s)",
+    y = "Modelled Water Discharge (m3/s)"
+  ) +
+  scale_color_brewer(palette = "Set2") +  # 使用颜色区分季节
+  # 添加拟合优度信息
+  annotate("text", x = max(comparison_data$`Water discharge2 (m3/s)`) * 0.7, 
+           y = max(comparison_data$Model_Discharge) * 0.5,
+           label = paste("R² = ", round(stats$R2, 3), "\nRMSE = ", round(stats$RMSE, 2), "\nMAE = ", round(stats$MAE, 2)),
+           color = "black") +
+  coord_fixed(ratio = 1)
+```
