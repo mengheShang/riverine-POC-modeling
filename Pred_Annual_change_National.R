@@ -8,25 +8,14 @@ library(patchwork)
 library(grid)
 library(lubridate)
 
-basin_result <- read_excel("E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx")
-
-# 1) Compute monthly flux per basin (Tg/month) with SE
-basin_monthly <- basin_result %>%
-  mutate(
-    Date = as.Date(paste(Year, sprintf("%02d", Month), "01", sep = "-")),
-    Days_in_month = days_in_month(Date),
-    Sec_in_month  = Days_in_month * 24 * 3600,
-    # Flux
-    Fpoc_basin_month = Avg_Cpoc * Sum_Q * Sec_in_month / 1e12,   # Tg/month
-    
-  )
+basin_monthly <- read_excel("E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx")
 
 # 2) Aggregate to annual flux per basin (sum of months)
 #    Variances add when summing independent months
 basin_annual <- basin_monthly %>%
   group_by(BasinName, Year) %>%
   summarise(
-    Fpoc_basin_year    = sum(Fpoc_basin_month, na.rm = TRUE),
+    Fpoc_basin_year = sum(Predicted_Fpoc_Tg_month, na.rm = TRUE),
     .groups = "drop"
   )
 

@@ -1,10 +1,29 @@
+
+## Normalized Annual Trend ####
 library(dplyr)
 library(ggplot2)
 library(purrr)
 library(patchwork)
-## Normalized Annual Trend ####
+library(lubridate)
+
 # Purpose: Show normalized annual trends for Cpoc, Q, and Fpoc
 # Use mean for Cpoc and Q, sum for Fpoc.
+
+library(readxl)
+
+# Purpose: Show monthly average Cpoc and Fpoc for each basin, using correct logic (sum for Fpoc, mean for Cpoc).
+basin_result <- read_excel("E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx")
+
+# Compute monthly flux per basin (Tg/month) with SE
+basin_monthly <- basin_result %>%
+  mutate(
+    Date = as.Date(paste(Year, sprintf("%02d", Month), "01", sep = "-")),
+    Days_in_month = days_in_month(Date),
+    Sec_in_month  = Days_in_month * 24 * 3600,
+    # Flux
+    Fpoc_basin_month = Avg_Cpoc * Sum_Q * Sec_in_month / 1e12,   # Tg/month
+    
+  )
 
 # 1) Aggregate to annual flux per basin (sum of months)
 annual_data <- basin_monthly %>%
@@ -86,7 +105,20 @@ plots <- c(
 )
 
 # 7. final arrangement function
+library(patchwork)
+library(grid)
+library(cowplot)
+library(purrr)
+
+plots <- c(
+  list(make_plot("All", show_legend = TRUE)),
+  map(basin_order[-1], ~ make_plot(.x, show_legend = FALSE))
+)
+
+# 7. final arrangement function with left column for y-axis
 arrange_basin_plots <- function(plot_list, ylab) {
+  
+  # Define patchwork layout
   layout <- "
   AAA
   AAA
@@ -94,6 +126,8 @@ arrange_basin_plots <- function(plot_list, ylab) {
   EFG
   HIJ
   "
+  
+  # Combine individual plots according to layout
   combined <- wrap_plots(
     A = plot_list[[1]],
     B = plot_list[[2]], C = plot_list[[3]], D = plot_list[[4]],
@@ -102,23 +136,18 @@ arrange_basin_plots <- function(plot_list, ylab) {
     design = layout
   )
   
-  grid.newpage()
-  pushViewport(viewport(layout = grid.layout(2, 1, heights = unit(c(0.95, 0.05), "npc"))))
+  # Create left y-axis label grob
+  left_lab <- textGrob(ylab, rot = 90, gp = gpar(fontsize = 12))
   
-  # 主图
-  pushViewport(viewport(layout.pos.row = 1))
-  print(combined, newpage = FALSE)
-  popViewport()
+  # Combine left label and plots using cowplot
+  final <- plot_grid(
+    left_lab, combined,  # left column for y-axis, main plots
+    ncol = 2,
+    rel_widths = c(0.05, 0.95)  # small column for y-axis, large for plots
+  )
   
-  # X label
-  pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Year", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
-  popViewport()
-  
-  # Y label
-  pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text(ylab, gp = gpar(fontsize = 12))
-  popViewport()
+  # Print the final layout
+  print(final)
 }
 
 arrange_basin_plots(plots, "Normalized values")

@@ -2,16 +2,20 @@
 library(dplyr)
 library(ggplot2)
 library(purrr)
+library(lubridate)
 library(patchwork)
+library(readxl)
+library(cowplot) 
 
 # Purpose: Show monthly average Cpoc and Fpoc for each basin, using correct logic (sum for Fpoc, mean for Cpoc).
+basin_monthly <- read_excel("E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx")
 
 # 1. Calculate monthly average Cpoc and total Fpoc for each basin
 monthly_avg <- basin_monthly %>%
   group_by(BasinName, Month) %>%
   summarise(
     Avg_Cpoc = mean(Avg_Cpoc, na.rm = TRUE),  # Mean Cpoc
-    Sum_Fpoc = sum(Fpoc_basin_month, na.rm = TRUE),  # Total Fpoc
+    Fpoc = mean(Predicted_Fpoc_Tg_month, na.rm = TRUE), 
     .groups = "drop"
   )
 
@@ -20,7 +24,7 @@ monthly_all <- monthly_avg %>%
   group_by(Month) %>%
   summarise(
     Avg_Cpoc = mean(Avg_Cpoc, na.rm = TRUE),
-    Sum_Fpoc = sum(Sum_Fpoc, na.rm = TRUE),
+    Fpoc = sum(Fpoc, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   mutate(BasinName = "All")
@@ -28,39 +32,45 @@ monthly_all <- monthly_avg %>%
 monthly_avg <- bind_rows(monthly_avg, monthly_all)
 
 # 3. Plotting function
-make_month_plot <- function(basin_name) {
+make_month_plot <- function(basin_name, show_legend = FALSE) {
   df <- monthly_avg %>% filter(BasinName == basin_name)
-  scale_factor <- max(df$Avg_Cpoc, na.rm = TRUE) / max(df$Sum_Fpoc, na.rm = TRUE)
-  offset <- 0  # Adjust if needed
+  scale_factor <- max(df$Avg_Cpoc, na.rm = TRUE) / max(df$Fpoc, na.rm = TRUE)
+  offset <- 0
   
-  ggplot(df, aes(x = Month)) +
-    geom_line(aes(y = Sum_Fpoc), color = "sienna", size = 1) +
-    geom_point(aes(y = Sum_Fpoc), color = "sienna", size = 2) +
-    geom_smooth(aes(y = Sum_Fpoc), method = "lm", se = FALSE, linetype = "dashed", color = "black") +
-    geom_line(aes(y = Avg_Cpoc / scale_factor + offset), color = "steelblue", size = 1) +
-    geom_point(aes(y = Avg_Cpoc / scale_factor + offset), color = "steelblue", size = 2) +
-    geom_smooth(aes(y = Avg_Cpoc / scale_factor + offset), method = "lm", se = FALSE, linetype = "dashed", color = "black") +
+  p <- ggplot(df, aes(x = Month)) +
+    geom_line(aes(y = Fpoc, color = "Fpoc"), size = 1, show.legend = show_legend) +
+    geom_point(aes(y = Fpoc, color = "Fpoc"), size = 2, show.legend = show_legend) +
+    geom_line(aes(y = Avg_Cpoc / scale_factor + offset, color = "Cpoc"), size = 1, show.legend = show_legend) +
+    geom_point(aes(y = Avg_Cpoc / scale_factor + offset, color = "Cpoc"), size = 2, show.legend = show_legend) +
     scale_y_continuous(
-      name = expression(F[POC]~"(Tg/month)"),
-      sec.axis = sec_axis(~ . * scale_factor + offset, name = expression(C[POC]~"(mg/L)"))
+      name = NULL,
+      sec.axis = sec_axis(~ . * scale_factor + offset, name = NULL)
     ) +
-    labs(title = basin_name, x = "Month",
-         subtitle = paste0(
-           "Fpoc trend slope: ", round(coef(lm(Sum_Fpoc ~ Month, data = df))[2], 4),
-           ", Cpoc trend slope: ", round(coef(lm(Avg_Cpoc ~ Month, data = df))[2], 4)
-         )) +
-    theme_minimal(base_size = 12)
+    scale_x_continuous(
+      breaks = 1:12,
+      labels = 1:12,
+      limits = c(1, 12)
+    ) +
+    scale_color_manual(
+      values = c("Fpoc" = "sienna", "Cpoc" = "steelblue"),
+      name = NULL
+    ) +
+    labs(title = basin_name, x = "Month") +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.title.y = element_blank(),
+      axis.title.y.right = element_blank(),
+      plot.margin = ggplot2::margin(t = 5, b = 5, l = 5, r = 5),
+      legend.position = ifelse(show_legend, "top", "none")
+    )
+  
+  return(p)
 }
 
-# 4. Combine overall plot + subplots
-basin_order <- c("All",
-                 "Songliao River","Haihe River","Yellow River",
-                 "Huaihe River","Yangtze River","Southwest Rivers",
-                 "Southeast Rivers","Pearl River","Hainan Island")
+# 绘制所有图
+plots <- map(basin_order, ~ make_month_plot(.x, show_legend = (.x == "All")))
 
-plots <- map(basin_order, make_month_plot)
-
-# Layout for combined plots
+# patchwork 合并布局
 layout <- "
 AAA
 AAA
@@ -68,10 +78,23 @@ BCD
 EFG
 HIJ
 "
-wrap_plots(
+
+combined <- wrap_plots(
   A = plots[[1]],
   B = plots[[2]], C = plots[[3]], D = plots[[4]],
   E = plots[[5]], F = plots[[6]], G = plots[[7]],
   H = plots[[8]], I = plots[[9]], J = plots[[10]],
   design = layout
 )
+
+# cowplot 添加左右全局纵坐标
+left_lab  <- grid::textGrob(expression(F[POC]~"(Tg/month)"), rot = 90, gp = gpar(fontsize = 12))
+right_lab <- grid::textGrob(expression(C[POC]~"(mg/L)"), rot = -90, gp = gpar(fontsize = 12))
+
+final <- plot_grid(
+  left_lab, combined, right_lab,
+  ncol = 3,
+  rel_widths = c(0.05, 0.9, 0.05)
+)
+
+print(final)

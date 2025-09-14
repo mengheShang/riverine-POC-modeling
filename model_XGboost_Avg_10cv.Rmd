@@ -189,7 +189,6 @@ for (i in seq_along(folds)) {
   xgb_model <- xgb.train(
     params = xgb_params,
     data = dtrain,
-    nrounds = 100,
     verbose = 0
   )
   
@@ -294,51 +293,6 @@ custom_theme <- theme_minimal() +
   )
 
 ## plotting function with proper axis handling ####
-library(plotly)
-
-create_basin_plot_interactive <- function(data, basin_name, x_var, y_var, metrics) {
-  plot_data <- data %>% 
-    filter(Basin_EN == basin_name) %>%
-    mutate(Discharge_filled_by_model = factor(
-      Discharge_filled_by_model,
-      levels = c(0, 1),
-      labels = c("No", "Yes")
-    ))
-  
-  basin_metrics <- metrics %>% filter(Basin_EN == basin_name)
-  
-  txt_label <- if (nrow(basin_metrics) == 0 || is.na(basin_metrics$R2) || is.na(basin_metrics$RMSE)) {
-    "R² = NA\nRMSE = NA"
-  } else {
-    paste0("R² = ", round(basin_metrics$R2, 2),
-           "\nRMSE = ", round(basin_metrics$RMSE, 2))
-  }
-  
-  axis_max <- max(plot_data[[x_var]], plot_data[[y_var]], na.rm = TRUE) * 1.05
-  
-  p <- ggplot(plot_data, aes(
-    x = .data[[x_var]],
-    y = .data[[y_var]],
-    shape = Discharge_filled_by_model,
-    text = paste("Station ID:", ID,  # <--- 替换为你实际的 ID 列名
-                 "<br>Obs:", .data[[x_var]],
-                 "<br>Pred:", .data[[y_var]])
-  )) +
-    geom_point(color = "steelblue", size = 2, alpha = 0.7) +
-    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
-    annotate("text", x = 0.05*axis_max, y = 0.95*axis_max,
-             label = txt_label, hjust = 0, vjust = 1, size = 3.5) +
-    coord_fixed(ratio = 1, xlim = c(0, axis_max), ylim = c(0, axis_max)) +
-    scale_shape_manual(
-      values = c("No" = 16, "Yes" = 17),
-      name = "Filled by Model"
-    ) +
-    labs(x = NULL, y = NULL, shape = "Filled by Model", title = basin_name) +
-    custom_theme
-  
-  ggplotly(p, tooltip = "text")  # Convert to interactive
-}
-
 create_basin_plot <- function(data, basin_name, x_var, y_var, metrics, is_flux = FALSE) {
   plot_data <- data %>% filter(Basin_EN == basin_name)
 
@@ -386,43 +340,9 @@ flux_plots <- map(basin_order, ~ create_basin_plot(
 
 ## Arrange Plots with Proper Labeling ####
 library(grid)
-# Custom layout function
-arrange_plots <- function(plot_list, title) {
-  layout <- "
-  AAB
-  AAC
-  DEF
-  GH.
-  "
-  
-  combined <- wrap_plots(
-    A = plot_list[[1]], B = plot_list[[2]], C = plot_list[[3]],
-    D = plot_list[[4]], E = plot_list[[5]], F = plot_list[[6]],
-    G = plot_list[[7]], H = plot_list[[8]], design = layout
-  )
-  
-  # Add global labels using grid
-  grid.newpage()
-  pushViewport(viewport(layout = grid.layout(2, 1, heights = unit(c(0.95, 0.05), "npc"))))
-  
-  # Main plots
-  pushViewport(viewport(layout.pos.row = 1))
-  print(combined, newpage = FALSE)
-  popViewport()
-  
-  # X-axis label
-  pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Observed Values", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
-  popViewport()
-  
-  # Y-axis label
-  pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text("Estimated Values", gp = gpar(fontsize = 12))
-  popViewport()
-}
 
 # Custom layout function
-arrange_plots <- function(plot_list, title) {
+arrange_plots <- function(plot_list, title, x_label, y_label) {
   layout <- "
   AAB
   AAC
@@ -447,18 +367,21 @@ arrange_plots <- function(plot_list, title) {
   
   # X-axis label
   pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Observed POC Flux(Tg/year)", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
+  grid.text(x_label, x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
   popViewport()
   
   # Y-axis label
   pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text("Estimated POC Flux(Tg/year)", gp = gpar(fontsize = 12))
+  grid.text(y_label, gp = gpar(fontsize = 12))
   popViewport()
 }
 
 # Generate final outputs
-arrange_plots(conc_plots, "POC Concentration")
-arrange_plots(flux_plots, "POC Flux")
+library(ggplot2)
+library(patchwork)
+
+arrange_plots(conc_plots, "POC Concentration", "Observed POC(mg/L)", "Estimated POC(mg/L)") 
+arrange_plots(flux_plots, "POC Flux", "Observed POC Flux(Tg/year)", "Estimated POC Flux(Tg/year)")
 ```
 
 
@@ -863,7 +786,12 @@ model_dir <- "E:/POC research/data/models/xgb_models"
 best_xgb_ensemble <- load_xgb_models(model_dir, num_folds = 10)
 
 # Predict Cpoc
-new_outlet_data$Predicted_Cpoc <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
+# new_outlet_data$Predicted_Cpoc <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
+# Predict Cpoc in log space
+y_pred_log <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
+
+# Back-transform to original mg/L scale
+new_outlet_data$Predicted_Cpoc <- pmax(0, expm1(y_pred_log))
 
 poc_result <- new_outlet_data %>%
   select(Gridcode, WatershedID, Longitude, Latitude, Year, Month, `Q (m3/s)`, Predicted_Cpoc)
