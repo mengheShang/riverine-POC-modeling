@@ -849,3 +849,87 @@ write_xlsx(
   "E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx"
 )
 ```
+
+```{r Atrribution}
+library(dplyr)
+
+# Step 1. Define driver groups
+drivers <- list(
+  Ta     = c("Temperature"),
+  Precip = c("precip1", "precip2"),
+  CO2    = c("CO2_global"),
+  LWDR   = c("LWdown")
+  # extend until all 80 features are covered
+)
+
+# Step 2. Helper: detrend one variable relative to reference year
+detrend_to_ref <- function(df, var, id_col="ID", year_col="Year", ref_year=1960) {
+  df %>%
+    group_by(!!sym(id_col)) %>%
+    mutate(
+      ref_val = mean(.data[[var]][.data[[year_col]] == ref_year], na.rm=TRUE),
+      model = list(lm(.data[[var]] ~ .data[[year_col]])),
+      pred = predict(model[[1]], newdata=data.frame(Year=.data[[year_col]])),
+      !!var := .data[[var]] - (pred - ref_val)
+    ) %>%
+    ungroup() %>%
+    select(-ref_val, -model, -pred)
+}
+
+# Step 3. Helper: create control experiment scenario
+make_scenario <- function(df, driver_vars, type="detrend", ref_year=1960) {
+  df_new <- df
+  for (v in driver_vars) {
+    if (type == "detrend") {
+      df_new <- detrend_to_ref(df_new, v, id_col="ID", year_col="Year", ref_year=ref_year)
+    } else if (type == "fix") {
+      fixed_val <- mean(df_new %>% filter(Year == ref_year) %>% pull(v), na.rm=TRUE)
+      df_new[[v]] <- fixed_val
+    }
+  }
+  return(df_new)
+}
+
+# Step 4. Build all scenarios
+scenarios <- list()
+scenarios[["Base"]] <- poc_data_clean
+for (drv in names(drivers)) {
+  scenarios[[paste0("NoTrend_", drv)]] <- make_scenario(
+    poc_data_clean, drivers[[drv]], type="detrend", ref_year=1960
+  )
+}
+
+# Step 5. Predict and compute trends
+results <- list()
+for (sc in names(scenarios)) {
+  df <- scenarios[[sc]]
+  X_new <- df %>% select(all_of(colnames(X))) %>% mutate_all(as.numeric)
+  pred_log <- predict_xgb_ensemble(X_new, best_xgb_ensemble)
+  df$Predicted_Fpoc <- pmax(0, expm1(pred_log))
+  annual <- df %>%
+    group_by(ID, Year) %>%
+    summarise(Annual_Fpoc = mean(Predicted_Fpoc, na.rm=TRUE), .groups="drop")
+  trend <- annual %>%
+    group_by(ID) %>%
+    summarise(slope = ifelse(n() > 1, coef(lm(Annual_Fpoc ~ Year))[2], NA), .groups="drop")
+  results[[sc]] <- list(annual=annual, trend=trend)
+}
+
+# Step 6. Calculate contributions
+contributions <- list()
+base_trend <- results[["Base"]]$trend
+for (drv in names(drivers)) {
+  control_trend <- results[[paste0("NoTrend_", drv)]]$trend
+  contrib <- base_trend %>%
+    left_join(control_trend, by="ID", suffix=c("_Base","_Control")) %>%
+    mutate(Contribution = slope_Base - slope_Control,
+           Driver = drv)
+  contributions[[drv]] <- contrib
+}
+
+# Step 7. Combine all contributions into one table
+contrib_all <- bind_rows(contributions)
+
+
+```
+
