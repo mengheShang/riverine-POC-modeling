@@ -36,7 +36,7 @@ make_month_plot <- function(basin_name, show_legend = FALSE) {
   df <- monthly_avg %>% filter(BasinName == basin_name)
   scale_factor <- max(df$Avg_Cpoc, na.rm = TRUE) / max(df$Fpoc, na.rm = TRUE)
   offset <- 0
-  
+
   p <- ggplot(df, aes(x = Month)) +
     geom_line(aes(y = Fpoc, color = "Fpoc"), size = 1, show.legend = show_legend) +
     geom_point(aes(y = Fpoc, color = "Fpoc"), size = 2, show.legend = show_legend) +
@@ -63,7 +63,6 @@ make_month_plot <- function(basin_name, show_legend = FALSE) {
       plot.margin = ggplot2::margin(t = 5, b = 5, l = 5, r = 5),
       legend.position = ifelse(show_legend, "top", "none")
     )
-  
   return(p)
 }
 
