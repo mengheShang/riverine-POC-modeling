@@ -6,6 +6,7 @@ library(dplyr)
 library(randomForest)
 library(caret)
 library(readxl)
+library(writexl)
 library(ggplot2)
 library(sf)
 library(patchwork)
@@ -26,7 +27,8 @@ basin_name_mapping <- c(
   "西南国际河流流域" = "Southwest Rivers Basin"
 )
 
-poc_data <- read_excel("2_inputData_watershed\\Input_features.xlsx") %>% as.data.frame() |>
+poc_data <- read_excel("E:\\POC research\\data\\2_inputData_watershed\\Input_features.xlsx") %>% 
+  as.data.frame() %>%
   mutate(
     `POC_flux(Tg/year)` = `POC_flux(g/s)` * 3.15576e7 / 1e12,
     `POC_flux(Tg/year)` = round(`POC_flux(Tg/year)`, 6)
@@ -68,11 +70,14 @@ poc_data_clean <- poc_data %>%
 
 sum(is.na(poc_data_clean))
 
+write_xlsx(poc_data_clean, "E:\\POC research\\data\\2_inputData_watershed\\Input_Features_clean.xlsx")
+
 set.seed(123)
 
 X <- poc_data_clean %>% select(-ID,  -Year, -Longitude, -Latitude,
-                                 -`POC(mg/L)`, -`Water_discharge(m3/s)`, -`POC_flux(Tg/year)`, 
-                                 -Basin_Name,
+                               -`POC(mg/L)`, -`Water_discharge(m3/s)`,
+                               -`POC_flux(Tg/year)`, 
+                               -Basin_Name,
                                -Discharge_filled_by_model)
 # y <- poc_data_clean$`POC(mg/L)`
 y <- log1p(poc_data_clean$`POC(mg/L)`)   # log(1 + y)
@@ -771,6 +776,8 @@ new_X <- new_outlet_data %>%
   select(all_of(colnames(X))) %>%
   mutate_all(as.numeric)
 
+write_xlsx(new_X, "E:/POC research/data/5_Prediction/Outlets/input_features/Input_Features_clean.xlsx")
+
 # function to Load all xgb models from files 
 load_xgb_models <- function(model_dir, num_folds) {
   models <- list()
@@ -850,38 +857,137 @@ write_xlsx(
 )
 ```
 
-```{r Atrribution}
+```{r Attribution}
 library(dplyr)
+library(readxl)
+
+# data preparation
+X_new <- read_excel("E:/POC research/data/5_Prediction/Outlets/input_features/Input_Features_clean.xlsx")
+
+needed_cols <- c("Gridcode", "Year", colnames(X)) 
+new_outlet_data <- new_outlet_data %>%
+  select(any_of(needed_cols)) %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.)))) 
+
+# function to Load all xgb models from files 
+load_xgb_models <- function(model_dir, num_folds) {
+  models <- list()
+  for (i in seq_len(num_folds)) {
+    model_path <- file.path(model_dir, paste0("xgb_model_fold_", i, ".model"))
+    models[[i]] <- xgb.load(model_path)
+  }
+  return(models)
+}
+# Function to predict by averaging all 10 models
+predict_xgb_ensemble <- function(newdata, models) {
+  dnew <- xgb.DMatrix(data = as.matrix(newdata))
+  preds <- sapply(models, function(model) {
+    predict(model, dnew)
+  })
+  rowMeans(preds)  # Average across models
+}
 
 # Step 1. Define driver groups
 drivers <- list(
-  Ta     = c("Temperature"),
-  Precip = c("precip1", "precip2"),
-  CO2    = c("CO2_global"),
-  LWDR   = c("LWdown")
-  # extend until all 80 features are covered
+  Temperature     = c("Temperature"),
+  Precipitation = c("Precipitation"),
+  Slope = c("Slope"),
+  upSlope = c("upSlope"),
+  Elev_range = c("Elev_range"),
+  Nearest_Dam_Height = c("Nearest_Dam_Height_m"),
+  Nearest_CatchmentArea = c("Nearest_CatchmentArea_km2"),
+  Nearest_Depth = c("Nearest_Depth_m"),
+  Nearest_Capacity = c("Nearest_Capacity_Mm3"),
+  Nearest_Discharge = c("Nearest_Discharge_ls"),
+  Nearest_DOR = c("Nearest_DOR_pc"),
+  Distance_to_Nearest_Dam = c("Distance_to_Nearest_Dam_km"),
+  Area = c("Area"),
+  Clay = c("Clay"),
+  Sand = c("Sand"),
+  Silt = c("Silt"),
+  SOC = c("SOC"),
+  Root_Depth = c("Root_Depth"),
+  pH_soil = c("pH_soil"),
+  Litter = c("Litter"),
+  C_factor = c("C_factor"),
+  K_factor = c("K_factor"),
+  LS_factor = c("LS_factor"),
+  R_factor = c("R_factor"),
+  Num_Dams = c("Num_Dams"),
+  Avg_DamHeight = c("Avg_DamHeight_m"),
+  Max_DamHeight = c("Max_DamHeight_m"),
+  Avg_CatchmentArea = c("Avg_CatchmentArea_km2"),
+  Sum_CatchmentArea = c("Sum_CatchmentArea_km2"),
+  Avg_Depth = c("Avg_Depth_m"),
+  Sum_Depth = c("Sum_Depth_m"),
+  Avg_Capacity = c("Avg_Capacity_Mm3"),
+  Sum_Capacity = c("Sum_Capacity_Mm3"),
+  Avg_Discharge = c("Avg_Discharge_ls"),
+  Sum_Discharge = c("Sum_Discharge_ls"),
+  Avg_DOR = c("Avg_DOR_pc"),
+  Cropland = c("Cropland"),
+  Forest = c("Forest"),
+  Shrub = c("Shrub"),
+  Grassland = c("Grassland"),
+  Water = c("Water"),
+  Snow_Ice = c("Snow_Ice"),
+  Barren = c("Barren"),
+  Urban = c("Urban"),
+  Wetland = c("Wetland"),
+  SoilLoss = c("SoilLoss"),
+  GDP = c("GDP_std"),
+  Pop_density = c("Pop_density"),
+  Num_Dams_10yr = c("Num_Dams_10yr"),
+  Num_Dams_20yr = c("Num_Dams_20yr"),
+  Num_Dams_30yr = c("Num_Dams_30yr"),
+  Num_Dams_40yr = c("Num_Dams_40yr"),
+  Num_Dams_50yr = c("Num_Dams_50yr"),
+  NPP = c("NPP"),
+  NDVI = c("NDVI"),
+  Litho_Glaciated_areas = c("Glaciated areas"),
+  Litho_SC = c("Carbonate rocks(SC)"),
+  Litho_LO = c("Loess (LO)"),
+  Litho_EP = c("Quaternary evaporites (EP)"),
+  Litho_DS = c("Dune sediments (DS)"),
+  Litho_SU = c("Semi-to unconsolidated sedments (SU)"),
+  Litho_AD = c("Alluvial deposits (AD)"),
+  Litho_SS = c("Siliciclastic sedimentary rocks (SS)"),
+  Litho_SM = c("Mixed sedimentary rocks (SM)"),
+  Litho_CL = c("Complex lithology (CL)"),
+  Litho_PR = c("Basement rocks (Precambrian shields) (PR)"),
+  Litho_MT = c("Metamorphics (MT)"),
+  Litho_PA = c("Plutonics, acid (PA)"),
+  Litho_PB = c("Plutonics, basic (PB)"),
+  Litho_VA = c("Volcanics, acid (VA)"),
+  Litho_VB = c("Volcanics, basic (VB)")
 )
 
 # Step 2. Helper: detrend one variable relative to reference year
-detrend_to_ref <- function(df, var, id_col="ID", year_col="Year", ref_year=1960) {
+detrend_to_ref <- function(df, var, id_col="Gridcode", year_col="Year", ref_year=1960) {
   df %>%
     group_by(!!sym(id_col)) %>%
-    mutate(
-      ref_val = mean(.data[[var]][.data[[year_col]] == ref_year], na.rm=TRUE),
-      model = list(lm(.data[[var]] ~ .data[[year_col]])),
-      pred = predict(model[[1]], newdata=data.frame(Year=.data[[year_col]])),
-      !!var := .data[[var]] - (pred - ref_val)
-    ) %>%
-    ungroup() %>%
-    select(-ref_val, -model, -pred)
+    group_modify(~ {
+      dat <- .
+      # linear trend
+      fit <- lm(dat[[var]] ~ dat[[year_col]])
+      # ref average
+      ref_val <- mean(dat[[var]][dat[[year_col]] == ref_year], na.rm = TRUE)
+      # predicted value
+      pred <- predict(fit, newdata = data.frame(Year = dat[[year_col]]))
+      # detrend
+      dat[[var]] <- dat[[var]] - (pred - ref_val)
+      dat
+    }) %>%
+    ungroup()
 }
+
 
 # Step 3. Helper: create control experiment scenario
 make_scenario <- function(df, driver_vars, type="detrend", ref_year=1960) {
   df_new <- df
   for (v in driver_vars) {
     if (type == "detrend") {
-      df_new <- detrend_to_ref(df_new, v, id_col="ID", year_col="Year", ref_year=ref_year)
+      df_new <- detrend_to_ref(df_new, v, id_col="Gridcode", year_col="Year", ref_year=ref_year)
     } else if (type == "fix") {
       fixed_val <- mean(df_new %>% filter(Year == ref_year) %>% pull(v), na.rm=TRUE)
       df_new[[v]] <- fixed_val
@@ -892,25 +998,29 @@ make_scenario <- function(df, driver_vars, type="detrend", ref_year=1960) {
 
 # Step 4. Build all scenarios
 scenarios <- list()
-scenarios[["Base"]] <- poc_data_clean
+scenarios[["Base"]] <- new_outlet_data
 for (drv in names(drivers)) {
   scenarios[[paste0("NoTrend_", drv)]] <- make_scenario(
-    poc_data_clean, drivers[[drv]], type="detrend", ref_year=1960
+    new_outlet_data, drivers[[drv]], type="detrend", ref_year=1960
   )
 }
 
 # Step 5. Predict and compute trends
 results <- list()
+
+# Load models
+model_dir <- "E:/POC research/data/models/xgb_models"
+best_xgb_ensemble <- load_xgb_models(model_dir, num_folds = 10)
+
 for (sc in names(scenarios)) {
   df <- scenarios[[sc]]
-  X_new <- df %>% select(all_of(colnames(X))) %>% mutate_all(as.numeric)
   pred_log <- predict_xgb_ensemble(X_new, best_xgb_ensemble)
   df$Predicted_Fpoc <- pmax(0, expm1(pred_log))
   annual <- df %>%
-    group_by(ID, Year) %>%
+    group_by(Gridcode, Year) %>%
     summarise(Annual_Fpoc = mean(Predicted_Fpoc, na.rm=TRUE), .groups="drop")
   trend <- annual %>%
-    group_by(ID) %>%
+    group_by(Gridcode) %>%
     summarise(slope = ifelse(n() > 1, coef(lm(Annual_Fpoc ~ Year))[2], NA), .groups="drop")
   results[[sc]] <- list(annual=annual, trend=trend)
 }
@@ -921,7 +1031,7 @@ base_trend <- results[["Base"]]$trend
 for (drv in names(drivers)) {
   control_trend <- results[[paste0("NoTrend_", drv)]]$trend
   contrib <- base_trend %>%
-    left_join(control_trend, by="ID", suffix=c("_Base","_Control")) %>%
+    left_join(control_trend, by="Gridcode", suffix=c("_Base","_Control")) %>%
     mutate(Contribution = slope_Base - slope_Control,
            Driver = drv)
   contributions[[drv]] <- contrib
@@ -929,7 +1039,5 @@ for (drv in names(drivers)) {
 
 # Step 7. Combine all contributions into one table
 contrib_all <- bind_rows(contributions)
-
-
 ```
 
