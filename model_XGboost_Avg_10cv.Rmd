@@ -1,4 +1,4 @@
-```{r }
+```{r Data preparation}
 # Preparation ####
 # Load libraries
 library(tidyr)
@@ -82,8 +82,7 @@ sum(is.na(X))
 
 ```
 
-```{r}
-# Model Building ####
+```{r Parameters}
 ## Parameter ####
 # library(caret)
 cv_control <- trainControl(
@@ -157,7 +156,7 @@ cv_control <- trainControl(
 ```
 
 
-```{r}
+```{r Training}
 ## Training ####
 # 10-fold Cross-validation splitting
 set.seed(123)
@@ -190,7 +189,6 @@ for (i in seq_along(folds)) {
   xgb_model <- xgb.train(
     params = xgb_params,
     data = dtrain,
-    nrounds = 100,
     verbose = 0
   )
   
@@ -209,6 +207,15 @@ predict_xgb_ensemble <- function(newdata, models) {
 # Save all xgb models
 best_xgb_ensemble <- xgb_models_list
 
+# Save all xgb models to files
+model_dir <- "E:/POC research/data/models/xgb_models"
+if (!dir.exists(model_dir)) dir.create(model_dir)
+
+for (i in seq_along(xgb_models_list)) {
+  model_path <- file.path(model_dir, paste0("xgb_model_fold_", i, ".model"))
+  xgb.save(xgb_models_list[[i]], model_path)
+}
+
 # Prediction ####
 # poc_data_clean$Predicted_Concentration <- predict_xgb_ensemble(X, best_xgb_ensemble)
 
@@ -218,7 +225,6 @@ y_pred_log <- predict_xgb_ensemble(X, best_xgb_ensemble)
 # back-transform
 poc_data_clean$Predicted_Concentration <- pmax(0, expm1(y_pred_log))  
 
-
 # Unit conversion for Fpoc
 conversion_factor <- 3.1536e-5
 poc_data_clean$Predicted_Flux_Tg_year <- poc_data_clean$Predicted_Concentration *
@@ -227,9 +233,7 @@ poc_data_clean$Observed_Flux_Tg_year <- poc_data_clean$`POC_flux(Tg/year)`
 ```
 
 
-```{r}
-# Model Evaluation ####
-## Total Evaluation Metrics ####
+```{r Evaluation Metrics}
 calc_metrics <- function(obs, pred) {
   fit <- lm(obs ~ pred)
   r2  <- summary(fit)$r.squared
@@ -277,8 +281,8 @@ metrics_flux_basin <- evaluation_data_final %>%
 
 ```
 
-```{r}
-# Visualization ####
+```{r Performance plot}
+
 custom_theme <- theme_minimal() +
   theme(
     panel.border = element_rect(color = "black", fill = NA, size = 0.5),
@@ -289,51 +293,6 @@ custom_theme <- theme_minimal() +
   )
 
 ## plotting function with proper axis handling ####
-library(plotly)
-
-create_basin_plot_interactive <- function(data, basin_name, x_var, y_var, metrics) {
-  plot_data <- data %>% 
-    filter(Basin_EN == basin_name) %>%
-    mutate(Discharge_filled_by_model = factor(
-      Discharge_filled_by_model,
-      levels = c(0, 1),
-      labels = c("No", "Yes")
-    ))
-  
-  basin_metrics <- metrics %>% filter(Basin_EN == basin_name)
-  
-  txt_label <- if (nrow(basin_metrics) == 0 || is.na(basin_metrics$R2) || is.na(basin_metrics$RMSE)) {
-    "R² = NA\nRMSE = NA"
-  } else {
-    paste0("R² = ", round(basin_metrics$R2, 2),
-           "\nRMSE = ", round(basin_metrics$RMSE, 2))
-  }
-  
-  axis_max <- max(plot_data[[x_var]], plot_data[[y_var]], na.rm = TRUE) * 1.05
-  
-  p <- ggplot(plot_data, aes(
-    x = .data[[x_var]],
-    y = .data[[y_var]],
-    shape = Discharge_filled_by_model,
-    text = paste("Station ID:", ID,  # <--- 替换为你实际的 ID 列名
-                 "<br>Obs:", .data[[x_var]],
-                 "<br>Pred:", .data[[y_var]])
-  )) +
-    geom_point(color = "steelblue", size = 2, alpha = 0.7) +
-    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
-    annotate("text", x = 0.05*axis_max, y = 0.95*axis_max,
-             label = txt_label, hjust = 0, vjust = 1, size = 3.5) +
-    coord_fixed(ratio = 1, xlim = c(0, axis_max), ylim = c(0, axis_max)) +
-    scale_shape_manual(
-      values = c("No" = 16, "Yes" = 17),
-      name = "Filled by Model"
-    ) +
-    labs(x = NULL, y = NULL, shape = "Filled by Model", title = basin_name) +
-    custom_theme
-  
-  ggplotly(p, tooltip = "text")  # Convert to interactive
-}
-
 create_basin_plot <- function(data, basin_name, x_var, y_var, metrics, is_flux = FALSE) {
   plot_data <- data %>% filter(Basin_EN == basin_name)
 
@@ -381,43 +340,9 @@ flux_plots <- map(basin_order, ~ create_basin_plot(
 
 ## Arrange Plots with Proper Labeling ####
 library(grid)
-# Custom layout function
-arrange_plots <- function(plot_list, title) {
-  layout <- "
-  AAB
-  AAC
-  DEF
-  GH.
-  "
-  
-  combined <- wrap_plots(
-    A = plot_list[[1]], B = plot_list[[2]], C = plot_list[[3]],
-    D = plot_list[[4]], E = plot_list[[5]], F = plot_list[[6]],
-    G = plot_list[[7]], H = plot_list[[8]], design = layout
-  )
-  
-  # Add global labels using grid
-  grid.newpage()
-  pushViewport(viewport(layout = grid.layout(2, 1, heights = unit(c(0.95, 0.05), "npc"))))
-  
-  # Main plots
-  pushViewport(viewport(layout.pos.row = 1))
-  print(combined, newpage = FALSE)
-  popViewport()
-  
-  # X-axis label
-  pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Observed Values", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
-  popViewport()
-  
-  # Y-axis label
-  pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text("Estimated Values", gp = gpar(fontsize = 12))
-  popViewport()
-}
 
 # Custom layout function
-arrange_plots <- function(plot_list, title) {
+arrange_plots <- function(plot_list, title, x_label, y_label) {
   layout <- "
   AAB
   AAC
@@ -442,23 +367,26 @@ arrange_plots <- function(plot_list, title) {
   
   # X-axis label
   pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Observed POC Flux(Tg/year)", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
+  grid.text(x_label, x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
   popViewport()
   
   # Y-axis label
   pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text("Estimated POC Flux(Tg/year)", gp = gpar(fontsize = 12))
+  grid.text(y_label, gp = gpar(fontsize = 12))
   popViewport()
 }
 
 # Generate final outputs
-arrange_plots(conc_plots, "POC Concentration")
-arrange_plots(flux_plots, "POC Flux")
+library(ggplot2)
+library(patchwork)
+
+arrange_plots(conc_plots, "POC Concentration", "Observed POC(mg/L)", "Estimated POC(mg/L)") 
+arrange_plots(flux_plots, "POC Flux", "Observed POC Flux(Tg/year)", "Estimated POC Flux(Tg/year)")
 ```
 
 
-```{r}
-## interactive plot ####
+```{r Interactive plot}
+## Interactive plot ####
 library(plotly)
 
 create_basin_plot_interactive <- function(data, basin_name, x_var, y_var, metrics) {
@@ -521,7 +449,7 @@ flux_plots_interactive[[1]]  # 查看第一个流域通量图
 
 ```
 
-```{r}
+```{r Feature Importance}
 # Feature Importance ####
 ## Permutation Importance ####
 # Function to calculate permutation importance
@@ -592,7 +520,7 @@ ggplot(perm_importance, aes(x = reorder(Feature, Importance), y = Importance)) +
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 
-## Importance for Categories ####
+## Perm Importance for Categories ####
 feature_map <- read_excel("E:/POC research/data/2_inputData_watershed/feature_categories.xlsx")
 perm_importance_with_cat <- merge(perm_importance, feature_map, by.x = "Feature", by.y = "Feature", all.x = TRUE)
 library(dplyr)
@@ -662,122 +590,8 @@ sv_importance(sv_avg, kind = "bar", max_display = Inf) +
 
 ```
 
+```{r Spatial pattern Prediction}
 
-```{r }
-# cols1 <- colnames(X)
-# cols2 <- colnames(new_outlet_data)
-# 
-# # Find columns present in one file but not the other
-# cols_only_in_X <- setdiff(cols1, cols2)
-# cols_only_in_new_outlet_data <- setdiff(cols2, cols1)
-# 
-# cat("Columns only in file1:\n")
-# print(cols_only_in_X)
-# 
-# cat("\nColumns only in file2:\n")
-# print(cols_only_in_new_outlet_data)
-
-# Outlets Prediction #### 
-# Read input variables
-new_outlet_data <- read_excel("E:/POC research/data/5_Prediction/Outlets/input_features/Input_Features.xlsx") %>% as.data.frame()
-
-# Standardize GDP
-new_outlet_data$GDP_std <- (new_outlet_data$GDP - mean(new_outlet_data$GDP, na.rm = TRUE)) / sd(new_outlet_data$GDP, na.rm = TRUE)
-
-# cols <- c(
-#   "Avg_DamHeight_m", "Max_DamHeight_m", "Avg_CatchmentArea_km2", "Sum_CatchmentArea_km2",
-#   "Avg_Depth_m", "Sum_Depth_m", "Avg_Capacity_Mm3", "Sum_Capacity_Mm3",
-#   "Avg_Discharge_ls", "Sum_Discharge_ls", "Avg_DOR_pc", "Nearest_Dam_Height_m",
-#   "Nearest_CatchmentArea_km2", "Nearest_Depth_m", "Nearest_Capacity_Mm3",
-#   "Nearest_Discharge_ls", "Nearest_DOR_pc", "Distance_to_Nearest_Dam_km"
-# )
-# 
-# new_outlet_data[cols] <- new_outlet_data[cols] %>%
-#   mutate(across(everything(), ~ ifelse(. == "NA" | is.na(.), 0, as.numeric(.)))) %>%
-#   mutate(across(where(is.numeric),  ~ replace(.x, is.na(.x) | is.infinite(.x), 0)))
-
-new_outlet_data <- new_outlet_data %>%
-  filter_all(all_vars(!is.na(.)))
-
-# Use the same name as Training
-new_X <- new_outlet_data %>%
-  filter_all(all_vars(!is.na(.))) %>%
-  select(all_of(colnames(X))) %>%
-  mutate_all(as.numeric)
-
-# Predict Cpoc
-new_outlet_data$Predicted_Cpoc <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
-
-poc_result <- new_outlet_data %>%
-  select(Gridcode, WatershedID, Longitude, Latitude, Year, Month, `Q (m3/s)`, Predicted_Cpoc)
-
-library(writexl)
-write_xlsx(
-  poc_result,
-  "E:/POC research/data/5_Prediction/Outlets/Cpoc_XGBoost_Predicted_Values.xlsx"
-)
-
-# Predict Fpoc
-# Gridcode -> BasinID
-new_outlet_data <- new_outlet_data %>%
-  mutate(BasinID = case_when(
-    Gridcode %in% c("11","12") ~ "1",
-    Gridcode %in% c("3","33","34","35","36","37") ~ "3",
-    Gridcode %in% c("4") ~ "4",
-    Gridcode %in% c("51","52","53") ~ "50",
-    Gridcode %in% c("6") ~ "6",
-    Gridcode %in% c("71","72","73") ~ "7",
-    Gridcode %in% c("81","82","83","84","85","86","87","88","89") ~ "8",
-    Gridcode %in% c("91","92","93") ~ "9",
-    Gridcode %in% c("101","102","103") ~ "10"
-  ))
-
-# BasinID -> BasinName
-basin_map <- c(
-  "1" = "Songliao River",
-  "3" = "Haihe River",
-  "4" = "Yellow River",
-  "50" = "Huaihe River",
-  "6" = "Yangtze River",
-  "7" = "Southwest Rivers",
-  "8" = "Southeast Rivers",
-  "9" = "Pearl River",
-  "10" = "Hainan Island"
-)
-new_outlet_data$BasinName <- basin_map[new_outlet_data$BasinID]
-
-basin_result <- new_outlet_data %>%
-
-# basin POC flux
-library(lubridate)
-# Calculate Cpoc uncertainty: SD of model prediction error (Predicted - Observed)
-if ("Cpoc" %in% names(new_outlet_data) & "Predicted_Cpoc" %in% names(new_outlet_data)) {
-  cpoc_sd <- sd(new_outlet_data$Predicted_Cpoc - new_outlet_data$Cpoc, na.rm = TRUE)
-} else {
-  cpoc_sd <- NA_real_
-}
-
-basin_result <- new_outlet_data %>%
-  group_by(BasinID, BasinName, Year, Month) %>%
-  summarise(
-    Avg_Cpoc = mean(Predicted_Cpoc, na.rm = TRUE),   # Mean Cpoc
-    Cpoc_SD = cpoc_sd,                               # Cpoc uncertainty (global SD)
-    Sum_Q =  first(`Q (m3/s)`),                      # Total discharge
-    .groups = "drop"
-  ) %>%
-  mutate(
-    Sec_in_month = days_in_month(ymd(paste(Year, Month, "01", sep="-"))) * 24 * 3600,
-    Predicted_Fpoc_Tg_month = Avg_Cpoc * Sum_Q * Sec_in_month / 1e12
-  )
-
-write_xlsx(
-  basin_result,
-  "E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx"
-)
-```
-
-```{r}
-# Spatial pattern Prediction ####
 library(readxl)
 library(dplyr)
 library(writexl)
@@ -826,6 +640,20 @@ new_X <- spatial_data %>%
 #     .groups = "drop"
 #   ) %>%
 #   arrange(desc(Temperature_NA_count)) 
+
+## Load all xgb models from files ####
+load_xgb_models <- function(model_dir, num_folds) {
+  models <- list()
+  for (i in seq_len(num_folds)) {
+    model_path <- file.path(model_dir, paste0("xgb_model_fold_", i, ".model"))
+    models[[i]] <- xgb.load(model_path)
+  }
+  return(models)
+}
+
+# Load models
+model_dir <- "E:/POC research/data/models/xgb_models"
+best_xgb_ensemble <- load_xgb_models(model_dir, num_folds = 10)
 
 ## Predict Cpoc ####
 # spatial_data$Predicted_Cpoc <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
@@ -900,273 +728,124 @@ write_xlsx(
 )
 ```
 
-```{r Draw Time series}
-## MultiYear Average ####
-library(readxl)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(patchwork)
-library(grid)
+```{r Outlets Prediction}
 library(lubridate)
+# cols1 <- colnames(X)
+# cols2 <- colnames(new_outlet_data)
+# 
+# # Find columns present in one file but not the other
+# cols_only_in_X <- setdiff(cols1, cols2)
+# cols_only_in_new_outlet_data <- setdiff(cols2, cols1)
+# 
+# cat("Columns only in file1:\n")
+# print(cols_only_in_X)
+# 
+# cat("\nColumns only in file2:\n")
+# print(cols_only_in_new_outlet_data)
 
-basin_result <- read_excel("E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx")
+# Outlets Prediction #### 
+# Read input variables
+new_outlet_data <- read_excel("E:/POC research/data/5_Prediction/Outlets/input_features/Input_Features.xlsx") %>% as.data.frame()
 
-# 1) Compute monthly flux per basin (Tg/month) with SE
-basin_monthly <- basin_result %>%
-  mutate(
-    Date = as.Date(paste(Year, sprintf("%02d", Month), "01", sep = "-")),
-    Days_in_month = days_in_month(Date),
-    Sec_in_month  = Days_in_month * 24 * 3600,
-    # Flux
-    Fpoc_basin_month = Avg_Cpoc * Sum_Q * Sec_in_month / 1e12,   # Tg/month
-    # SE propagation for product: F = C * Q * k
-    se_Fpoc_basin_month = abs(Fpoc_basin_month) * sqrt(
-      (sd(Avg_Cpoc, na.rm = TRUE) / pmax(mean(Avg_Cpoc, na.rm = TRUE), .Machine$double.eps))^2 +
-      (sd(Sum_Q,    na.rm = TRUE) / pmax(mean(Sum_Q,    na.rm = TRUE), .Machine$double.eps))^2
-    )
-  )
+# Standardize GDP
+new_outlet_data$GDP_std <- (new_outlet_data$GDP - mean(new_outlet_data$GDP, na.rm = TRUE)) / sd(new_outlet_data$GDP, na.rm = TRUE)
 
-# 2) Aggregate to annual flux per basin (sum of months)
-#    Variances add when summing independent months
-basin_annual <- basin_monthly %>%
-  group_by(BasinName, Year) %>%
-  summarise(
-    Fpoc_basin_year    = sum(Fpoc_basin_month, na.rm = TRUE),
-    se_Fpoc_basin_year = sqrt(sum(se_Fpoc_basin_month^2, na.rm = TRUE)),
-    .groups = "drop"
-  )
+# cols <- c(
+#   "Avg_DamHeight_m", "Max_DamHeight_m", "Avg_CatchmentArea_km2", "Sum_CatchmentArea_km2",
+#   "Avg_Depth_m", "Sum_Depth_m", "Avg_Capacity_Mm3", "Sum_Capacity_Mm3",
+#   "Avg_Discharge_ls", "Sum_Discharge_ls", "Avg_DOR_pc", "Nearest_Dam_Height_m",
+#   "Nearest_CatchmentArea_km2", "Nearest_Depth_m", "Nearest_Capacity_Mm3",
+#   "Nearest_Discharge_ls", "Nearest_DOR_pc", "Distance_to_Nearest_Dam_km"
+# )
+# 
+# new_outlet_data[cols] <- new_outlet_data[cols] %>%
+#   mutate(across(everything(), ~ ifelse(. == "NA" | is.na(.), 0, as.numeric(.)))) %>%
+#   mutate(across(where(is.numeric),  ~ replace(.x, is.na(.x) | is.infinite(.x), 0)))
 
-# 3) Aggregate to national annual flux (sum of basins)
-national_annual <- basin_annual %>%
-  group_by(Year) %>%
-  summarise(
-    Fpoc_all    = sum(Fpoc_basin_year, na.rm = TRUE),
-    se_Fpoc_all = sqrt(sum(se_Fpoc_basin_year^2, na.rm = TRUE)),
-    .groups = "drop"
-  )
+new_outlet_data <- new_outlet_data %>%
+  filter_all(all_vars(!is.na(.)))
 
-# 4) Plot with uncertainty ribbon
-ggplot(national_annual, aes(x = Year, y = Fpoc_all)) +
-  geom_line(color = "red", size = 1) +
-  geom_ribbon(aes(ymin = Fpoc_all - se_Fpoc_all,
-                  ymax = Fpoc_all + se_Fpoc_all),
-              fill = "red", alpha = 0.2) +
-  labs(title = "Time series of national POC flux",
-       subtitle = paste0("Trend slope: ", round(coef(lm(Fpoc_all ~ Year, data = national_annual))[2], 4), " Tg/year/year"),
-       x = "Year",
-       y = "Fpoc (Tg/year)") +
-  theme_minimal(base_size = 14)
+# Use the same name as Training
+new_X <- new_outlet_data %>%
+  filter_all(all_vars(!is.na(.))) %>%
+  select(all_of(colnames(X))) %>%
+  mutate_all(as.numeric)
 
-```
-
-```{r Normalized annual trend}
-## Normalized Annual Trend ####
-# Purpose: Show normalized annual trends for Cpoc, Q, and Fpoc
-# Use mean for Cpoc and Q, sum for Fpoc.
-
-# 1) Aggregate to annual flux per basin (sum of months)
-annual_data <- basin_monthly %>%
-  group_by(BasinName, Year) %>%
-  summarise(
-    mean_Cpoc = mean(Avg_Cpoc, na.rm = TRUE),
-    se_Cpoc   = sd(Avg_Cpoc, na.rm = TRUE) / sqrt(n()),
-    mean_Q    = mean(Sum_Q, na.rm = TRUE),
-    se_Q      = sd(Sum_Q, na.rm = TRUE) / sqrt(n()),
-    sum_Fpoc  = sum(Fpoc_basin_month, na.rm = TRUE),  # Tg/year
-    se_Fpoc   = sd(Fpoc_basin_month, na.rm = TRUE) / sqrt(n()),
-    .groups = "drop"
-  )
-
-# 2) National annual flux (sum over basins)
-annual_all <- annual_data %>%
-  group_by(Year) %>%
-  summarise(
-    mean_Cpoc = mean(mean_Cpoc, na.rm = TRUE),
-    se_Cpoc   = sd(mean_Cpoc, na.rm = TRUE) / sqrt(n()),
-    mean_Q    = mean(mean_Q, na.rm = TRUE),
-    se_Q      = sd(mean_Q, na.rm = TRUE) / sqrt(n()),
-    sum_Fpoc  = sum(sum_Fpoc, na.rm = TRUE),
-    se_Fpoc   = sqrt(sum(se_Fpoc^2, na.rm = TRUE)),
-    .groups = "drop"
-  ) %>%
-  mutate(BasinName = "All")
-
-# 3) Combine national and basin-level data
-annual_data <- bind_rows(annual_all, annual_data)
-
-# 4. long format for plotting
-annual_long <- annual_data %>%
-  pivot_longer(
-    cols = c(mean_Cpoc, mean_Q, sum_Fpoc, se_Cpoc, se_Q, se_Fpoc),
-    names_to = c(".value", "Metric"),
-    names_pattern = "(mean|sum|se)_(.*)"
-  ) %>%
-  group_by(BasinName, Metric) %>%
-  mutate(
-    norm_mean = mean / max(mean, na.rm = TRUE),
-    norm_se   = se   / max(mean, na.rm = TRUE)
-  ) %>%
-  ungroup()
-
-# 5. plotting function
-make_plot <- function(basin_name, show_legend = FALSE) {
-  df <- annual_long %>% filter(BasinName == basin_name)
-  p <- ggplot(df, aes(x = Year, y = norm_mean, color = Metric, fill = Metric)) +
-    geom_line(size = 1) +
-    geom_point(size = 2) +
-    geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black") +
-    scale_color_manual(values = c("Q"="purple","Cpoc"="darkgreen","Fpoc"="red")) +
-    scale_fill_manual(values = c("Q"="purple","Cpoc"="darkgreen","Fpoc"="red")) +
-    labs(title = basin_name, x = NULL, y = NULL,
-         subtitle = paste0("Trend slope: ",
-           paste(sapply(unique(df$Metric), function(m) {
-             slope <- coef(lm(norm_mean ~ Year, data = df[df$Metric == m,]))[2]
-             paste(m, round(slope, 4))
-           }), collapse = ", ")
-         )) +
-    theme_minimal(base_size = 12)
-
-  if (!show_legend) {
-    p <- p + theme(legend.position = "none")
+# function to Load all xgb models from files 
+load_xgb_models <- function(model_dir, num_folds) {
+  models <- list()
+  for (i in seq_len(num_folds)) {
+    model_path <- file.path(model_dir, paste0("xgb_model_fold_", i, ".model"))
+    models[[i]] <- xgb.load(model_path)
   }
-  return(p)
+  return(models)
 }
 
-# 6. Basin order
-basin_order <- c("All",
-                 "Songliao River","Haihe River","Yellow River",
-                 "Huaihe River","Yangtze River","Southwest Rivers",
-                 "Southeast Rivers","Pearl River","Hainan Island")
+# Load models
+model_dir <- "E:/POC research/data/models/xgb_models"
+best_xgb_ensemble <- load_xgb_models(model_dir, num_folds = 10)
 
-plots <- c(
-  list(make_plot("All", show_legend = TRUE)),
-  map(basin_order[-1], ~ make_plot(.x, show_legend = FALSE))
+# Predict Cpoc
+# new_outlet_data$Predicted_Cpoc <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
+# Predict Cpoc in log space
+y_pred_log <- predict_xgb_ensemble(new_X, best_xgb_ensemble)
+
+# Back-transform to original mg/L scale
+new_outlet_data$Predicted_Cpoc <- pmax(0, expm1(y_pred_log))
+
+poc_result <- new_outlet_data %>%
+  select(Gridcode, WatershedID, Longitude, Latitude, Year, Month, `Q (m3/s)`, Predicted_Cpoc)
+
+library(writexl)
+write_xlsx(
+  poc_result,
+  "E:/POC research/data/5_Prediction/Outlets/Cpoc_XGBoost_Predicted_Values.xlsx"
 )
 
-# 7. final arrangement function
-arrange_basin_plots <- function(plot_list, ylab) {
-  layout <- "
-  AAA
-  AAA
-  BCD
-  EFG
-  HIJ
-  "
-  combined <- wrap_plots(
-    A = plot_list[[1]],
-    B = plot_list[[2]], C = plot_list[[3]], D = plot_list[[4]],
-    E = plot_list[[5]], F = plot_list[[6]], G = plot_list[[7]],
-    H = plot_list[[8]], I = plot_list[[9]], J = plot_list[[10]],
-    design = layout
-  )
-  
-  grid.newpage()
-  pushViewport(viewport(layout = grid.layout(2, 1, heights = unit(c(0.95, 0.05), "npc"))))
-  
-  # 主图
-  pushViewport(viewport(layout.pos.row = 1))
-  print(combined, newpage = FALSE)
-  popViewport()
-  
-  # X label
-  pushViewport(viewport(layout.pos.row = 2))
-  grid.text("Year", x = 0.5, y = 0.5, gp = gpar(fontsize = 12))
-  popViewport()
-  
-  # Y label
-  pushViewport(viewport(x = 0.05, y = 0.5, angle = 90))
-  grid.text(ylab, gp = gpar(fontsize = 12))
-  popViewport()
-}
+# Predict Fpoc
+# Gridcode -> BasinID
+new_outlet_data <- new_outlet_data %>%
+  mutate(BasinID = case_when(
+    Gridcode %in% c("11","12") ~ "1",
+    Gridcode %in% c("3","33","34","35","36","37") ~ "3",
+    Gridcode %in% c("4") ~ "4",
+    Gridcode %in% c("51","52","53") ~ "50",
+    Gridcode %in% c("6") ~ "6",
+    Gridcode %in% c("71","72","73") ~ "7",
+    Gridcode %in% c("81","82","83","84","85","86","87","88","89") ~ "8",
+    Gridcode %in% c("91","92","93") ~ "9",
+    Gridcode %in% c("101","102","103") ~ "10"
+  ))
 
-arrange_basin_plots(plots, "Normalized values")
-```
+# BasinID -> BasinName
+basin_map <- c(
+  "1" = "Songliao River",
+  "3" = "Haihe River",
+  "4" = "Yellow River",
+  "50" = "Huaihe River",
+  "6" = "Yangtze River",
+  "7" = "Southwest Rivers",
+  "8" = "Southeast Rivers",
+  "9" = "Pearl River",
+  "10" = "Hainan Island"
+)
+new_outlet_data$BasinName <- basin_map[new_outlet_data$BasinID]
 
-```{r Check Monthly Avg}
-annual_data %>% filter(is.na(se_Cpoc) | is.na(se_Q))
-summary(annual_data)
-```
-
-```{r }
-## Draw Monthly Change ####
-library(dplyr)
-library(ggplot2)
-library(purrr)
-library(patchwork)
-
-# Purpose: Show monthly average Cpoc and Fpoc for each basin, using correct logic (sum for Fpoc, mean for Cpoc).
-
-# 1. Calculate monthly average Cpoc and total Fpoc for each basin
-monthly_avg <- basin_monthly %>%
-  group_by(BasinName, Month) %>%
+# basin POC flux
+basin_result <- new_outlet_data %>%
+  group_by(BasinID, BasinName, Year, Month) %>%
   summarise(
-    Avg_Cpoc = mean(Avg_Cpoc, na.rm = TRUE),  # Mean Cpoc
-    Sum_Fpoc = sum(Fpoc_basin_month, na.rm = TRUE),  # Total Fpoc
-    .groups = "drop"
-  )
-
-# 2. National monthly average
-monthly_all <- monthly_avg %>%
-  group_by(Month) %>%
-  summarise(
-    Avg_Cpoc = mean(Avg_Cpoc, na.rm = TRUE),
-    Sum_Fpoc = sum(Sum_Fpoc, na.rm = TRUE),
+    Avg_Cpoc = mean(Predicted_Cpoc, na.rm = TRUE),   # Mean Cpoc
+    Sum_Q =  first(`Q (m3/s)`),                      # Total discharge
     .groups = "drop"
   ) %>%
-  mutate(BasinName = "All")
+  mutate(
+    Sec_in_month = days_in_month(ymd(paste(Year, Month, "01", sep="-"))) * 24 * 3600,
+    Predicted_Fpoc_Tg_month = Avg_Cpoc * Sum_Q * Sec_in_month / 1e12
+  )
 
-monthly_avg <- bind_rows(monthly_avg, monthly_all)
-
-# 3. Plotting function
-make_month_plot <- function(basin_name) {
-  df <- monthly_avg %>% filter(BasinName == basin_name)
-  scale_factor <- max(df$Avg_Cpoc, na.rm = TRUE) / max(df$Sum_Fpoc, na.rm = TRUE)
-  offset <- 0  # Adjust if needed
-
-  ggplot(df, aes(x = Month)) +
-    geom_line(aes(y = Sum_Fpoc), color = "sienna", size = 1) +
-    geom_point(aes(y = Sum_Fpoc), color = "sienna", size = 2) +
-    geom_smooth(aes(y = Sum_Fpoc), method = "lm", se = FALSE, linetype = "dashed", color = "black") +
-    geom_line(aes(y = Avg_Cpoc / scale_factor + offset), color = "steelblue", size = 1) +
-    geom_point(aes(y = Avg_Cpoc / scale_factor + offset), color = "steelblue", size = 2) +
-    geom_smooth(aes(y = Avg_Cpoc / scale_factor + offset), method = "lm", se = FALSE, linetype = "dashed", color = "black") +
-    scale_y_continuous(
-      name = expression(F[POC]~"(Tg/month)"),
-      sec.axis = sec_axis(~ . * scale_factor + offset, name = expression(C[POC]~"(mg/L)"))
-    ) +
-    labs(title = basin_name, x = "Month",
-         subtitle = paste0(
-           "Fpoc trend slope: ", round(coef(lm(Sum_Fpoc ~ Month, data = df))[2], 4),
-           ", Cpoc trend slope: ", round(coef(lm(Avg_Cpoc ~ Month, data = df))[2], 4)
-         )) +
-    theme_minimal(base_size = 12)
-}
-
-# 4. Combine overall plot + subplots
-basin_order <- c("All",
-                 "Songliao River","Haihe River","Yellow River",
-                 "Huaihe River","Yangtze River","Southwest Rivers",
-                 "Southeast Rivers","Pearl River","Hainan Island")
-
-plots <- map(basin_order, make_month_plot)
-
-# Layout for combined plots
-layout <- "
-AAA
-AAA
-BCD
-EFG
-HIJ
-"
-wrap_plots(
-  A = plots[[1]],
-  B = plots[[2]], C = plots[[3]], D = plots[[4]],
-  E = plots[[5]], F = plots[[6]], G = plots[[7]],
-  H = plots[[8]], I = plots[[9]], J = plots[[10]],
-  design = layout
+write_xlsx(
+  basin_result,
+  "E:/POC research/data/5_Prediction/Outlets/Fpoc_XGBoost_Predicted_Values.xlsx"
 )
-
 ```
-
